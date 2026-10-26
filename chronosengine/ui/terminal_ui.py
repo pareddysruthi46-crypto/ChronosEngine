@@ -1,14 +1,17 @@
 
 import curses
+import time
+from collections import deque
 
 from chronosengine.matching_engine import MatchingEngine
 
-
 DEPTH_LEVELS = 5
+REFRESH_INTERVAL_MS = 250
+OPS_WINDOW_SECONDS = 1.0
 
 
 def safe_addstr(stdscr, y, x, text):
-    """Write text without exceeding the terminal boundaries."""
+    """Write text without exceeding terminal boundaries."""
     height, width = stdscr.getmaxyx()
 
     if y < 0 or y >= height or x < 0 or x >= width - 1:
@@ -22,8 +25,26 @@ def safe_addstr(stdscr, y, x, text):
         pass
 
 
-def draw_layout(stdscr, order_book=None):
-    """Render top-of-book information and a multi-level depth ladder."""
+def get_observed_order_ids(order_book, trades):
+    """Collect order IDs visible in the book and completed trades."""
+    order_ids = set()
+
+    for side in ("buys", "sells"):
+        for order in order_book.get(side, []):
+            order_ids.add(order["order_id"])
+
+    for trade in trades:
+        if "buy_order_id" in trade:
+            order_ids.add(trade["buy_order_id"])
+
+        if "sell_order_id" in trade:
+            order_ids.add(trade["sell_order_id"])
+
+    return order_ids
+
+
+def draw_layout(stdscr, order_book=None, ops=0):
+    """Render the order book and live throughput metric."""
     try:
         curses.curs_set(0)
     except curses.error:
@@ -32,12 +53,18 @@ def draw_layout(stdscr, order_book=None):
     stdscr.erase()
     height, width = stdscr.getmaxyx()
 
-    safe_addstr(stdscr, 0, 0, " ChronosEngine - Matching Engine Dashboard ")
+    safe_addstr(
+        stdscr, 0, 0,
+        " ChronosEngine - Matching Engine Dashboard ",
+    )
+    safe_addstr(
+        stdscr, 1, 2,
+        f"ORDERS/SEC (OPS): {ops}",
+    )
 
     if order_book is None:
         order_book = {"buys": [], "sells": []}
 
-    # Sort bids from highest to lowest and asks from lowest to highest.
     bids = sorted(
         order_book.get("buys", []),
         key=lambda order: float(order["price"]),
@@ -48,7 +75,6 @@ def draw_layout(stdscr, order_book=None):
         key=lambda order: float(order["price"]),
     )
 
-    # Top-of-book values.
     best_bid = bids[0] if bids else None
     best_ask = asks[0] if asks else None
 
@@ -56,11 +82,13 @@ def draw_layout(stdscr, order_book=None):
         safe_addstr(stdscr, 2, 2, "TOP OF BOOK")
 
         bid_text = (
-            f"{best_bid['price']:.2f} (Qty: {best_bid['quantity']})"
+            f"{best_bid['price']:.2f} "
+            f"(Qty: {best_bid['quantity']})"
             if best_bid else "--"
         )
         ask_text = (
-            f"{best_ask['price']:.2f} (Qty: {best_ask['quantity']})"
+            f"{best_ask['price']:.2f} "
+            f"(Qty: {best_ask['quantity']})"
             if best_ask else "--"
         )
 
@@ -69,7 +97,10 @@ def draw_layout(stdscr, order_book=None):
             f"BEST BID: {bid_text}    |    BEST ASK: {ask_text}",
         )
 
-        safe_addstr(stdscr, 5, 2, f"ORDER BOOK DEPTH - TOP {DEPTH_LEVELS} LEVELS")
+        safe_addstr(
+            stdscr, 5, 2,
+            f"ORDER BOOK DEPTH - TOP {DEPTH_LEVELS} LEVELS",
+        )
         safe_addstr(stdscr, 6, 2, "-" * min(width - 4, 60))
         safe_addstr(
             stdscr, 7, 2,
@@ -78,7 +109,6 @@ def draw_layout(stdscr, order_book=None):
         )
         safe_addstr(stdscr, 8, 2, "-" * min(width - 4, 60))
 
-        # Display as many levels as the terminal height allows, up to five.
         visible_levels = min(DEPTH_LEVELS, max(0, height - 10))
 
         if not bids and not asks:
@@ -88,14 +118,27 @@ def draw_layout(stdscr, order_book=None):
                 bid = bids[level] if level < len(bids) else None
                 ask = asks[level] if level < len(asks) else None
 
-                bid_price = f"{bid['price']:>12.2f}" if bid else f"{'--':>12}"
-                bid_qty = f"{bid['quantity']:>9}" if bid else f"{'--':>9}"
-                ask_price = f"{ask['price']:>12.2f}" if ask else f"{'--':>12}"
-                ask_qty = f"{ask['quantity']:>9}" if ask else f"{'--':>9}"
+                bid_price = (
+                    f"{bid['price']:>12.2f}"
+                    if bid else f"{'--':>12}"
+                )
+                bid_qty = (
+                    f"{bid['quantity']:>9}"
+                    if bid else f"{'--':>9}"
+                )
+                ask_price = (
+                    f"{ask['price']:>12.2f}"
+                    if ask else f"{'--':>12}"
+                )
+                ask_qty = (
+                    f"{ask['quantity']:>9}"
+                    if ask else f"{'--':>9}"
+                )
 
                 safe_addstr(
                     stdscr, 9 + level, 2,
-                    f"{bid_price} {bid_qty}  |  {ask_price} {ask_qty}",
+                    f"{bid_price} {bid_qty}  |  "
+                    f"{ask_price} {ask_qty}",
                 )
     else:
         safe_addstr(
@@ -110,14 +153,43 @@ def draw_layout(stdscr, order_book=None):
 
 
 def main(stdscr, engine=None):
-    """Run the dashboard using the supplied matching engine."""
+    """Run the dashboard and estimate observed orders per second."""
     if engine is None:
         engine = MatchingEngine()
 
-    while True:
-        draw_layout(stdscr, engine.get_order_book())
-        key = stdscr.getch()
+    # Refresh automatically, even when no key is pressed.
+    stdscr.timeout(REFRESH_INTERVAL_MS)
 
+    seen_order_ids = set()
+    recent_order_times = deque()
+
+    while True:
+        now = time.monotonic()
+
+        order_book = engine.get_order_book()
+        trades = engine.get_trades()
+
+        observed_ids = get_observed_order_ids(order_book, trades)
+
+        # Count each order ID only the first time it becomes observable.
+        new_order_ids = observed_ids - seen_order_ids
+        seen_order_ids.update(new_order_ids)
+
+        for _ in new_order_ids:
+            recent_order_times.append(now)
+
+        # Keep only orders observed during the last second.
+        while (
+            recent_order_times
+            and now - recent_order_times[0] >= OPS_WINDOW_SECONDS
+        ):
+            recent_order_times.popleft()
+
+        ops = len(recent_order_times)
+
+        draw_layout(stdscr, order_book, ops)
+
+        key = stdscr.getch()
         if key in (ord("q"), ord("Q")):
             break
 
