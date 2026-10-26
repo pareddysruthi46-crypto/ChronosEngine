@@ -3,51 +3,12 @@ import asyncio
 import random
 import time
 import argparse
-import struct
 
-SYMBOLS = ["AAPL", "MSFT", "GOOGL"]
-
-# Fixed binary layout:
-# symbol: 8 bytes
-# price: 8 bytes (double)
-# quantity: 4 bytes (unsigned int)
-# timestamp: 8 bytes (unsigned long long)
-TICK_STRUCT = struct.Struct("<8sdIQ")
-TICK_SIZE = TICK_STRUCT.size
+from mmap_ringbuffer import MMapRingBuffer
 
 
-def pack_tick(tick):
-    """Convert a tick dictionary into a fixed-size binary payload."""
-    symbol = tick["symbol"].encode("ascii")
-
-    if len(symbol) > 8:
-        raise ValueError("Symbol must be at most 8 ASCII bytes")
-
-    return TICK_STRUCT.pack(
-        symbol,
-        float(tick["price"]),
-        int(tick["quantity"]),
-        int(tick["timestamp"])
-    )
-
-
-def unpack_tick(payload):
-    """Decode a binary tick payload for validation."""
-    if len(payload) != TICK_SIZE:
-        raise ValueError(f"Payload must be exactly {TICK_SIZE} bytes")
-
-    symbol, price, quantity, timestamp = TICK_STRUCT.unpack(payload)
-
-    return {
-        "symbol": symbol.rstrip(b"\x00").decode("ascii"),
-        "price": price,
-        "quantity": quantity,
-        "timestamp": timestamp
-    }
-
-
-async def generate_mock_ticks(count=10, rate=100_000):
-    """Generate simulated ticks as fixed-size binary payloads."""
+async def generate_mock_orders(count=10, rate=100_000):
+    """Generate simulated orders asynchronously."""
 
     if count < 0:
         raise ValueError("count must be >= 0")
@@ -56,21 +17,21 @@ async def generate_mock_ticks(count=10, rate=100_000):
         raise ValueError("rate must be > 0")
 
     interval = 1.0 / rate
-    next_tick_time = time.perf_counter()
+    next_order_time = time.perf_counter()
 
-    for _ in range(count):
-        tick = {
-            "symbol": random.choice(SYMBOLS),
+    for i in range(count):
+        order = {
+            "order_id": i + 1,
+            "side": random.choice(["B", "S"]),
             "price": round(random.uniform(100, 250), 2),
             "quantity": random.randint(1, 1000),
             "timestamp": time.time_ns()
         }
 
-        payload = pack_tick(tick)
-        yield payload
+        yield order
 
-        next_tick_time += interval
-        remaining = next_tick_time - time.perf_counter()
+        next_order_time += interval
+        remaining = next_order_time - time.perf_counter()
 
         if remaining > 0:
             await asyncio.sleep(remaining)
@@ -78,21 +39,61 @@ async def generate_mock_ticks(count=10, rate=100_000):
             await asyncio.sleep(0)
 
 
+async def firehose_producer(buffer, count, rate, quiet=False):
+    """Generate orders and write directly into the mmap buffer."""
+
+    start = time.perf_counter()
+    generated = 0
+
+    async for order in generate_mock_orders(count, rate):
+        buffer.push(order)
+        generated += 1
+
+        if not quiet:
+            print("Written:", order)
+
+    elapsed = time.perf_counter() - start
+    throughput = generated / elapsed if elapsed > 0 else 0
+
+    return generated, elapsed, throughput
+
+
 async def main():
     parser = argparse.ArgumentParser(
-        description="Generate simulated binary financial ticks"
+        description="Async order producer for the mmap ring buffer"
     )
+
     parser.add_argument(
-        "--count", type=int, default=100_000,
-        help="Number of ticks to generate"
+        "--count",
+        type=int,
+        default=100_000,
+        help="Number of orders to generate"
     )
+
     parser.add_argument(
-        "--rate", type=int, default=100_000,
-        help="Target ticks per second"
+        "--rate",
+        type=int,
+        default=100_000,
+        help="Target orders per second"
     )
+
     parser.add_argument(
-        "--quiet", action="store_true",
-        help="Print only throughput statistics"
+        "--capacity",
+        type=int,
+        default=100,
+        help="Maximum number of orders stored in the buffer"
+    )
+
+    parser.add_argument(
+        "--buffer",
+        default="orders_buffer.dat",
+        help="Mmap buffer file path"
+    )
+
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress individual order output"
     )
 
     args = parser.parse_args()
@@ -103,25 +104,48 @@ async def main():
     if args.rate <= 0:
         parser.error("--rate must be > 0")
 
-    print(f"Target rate: {args.rate:,} ticks/sec")
-    print(f"Ticks to generate: {args.count:,}")
-    print(f"Payload size: {TICK_SIZE} bytes")
+    if args.capacity <= 0:
+        parser.error("--capacity must be > 0")
 
-    start = time.perf_counter()
-    generated = 0
+    buffer = MMapRingBuffer(
+        args.buffer,
+        capacity=args.capacity
+    )
 
-    async for payload in generate_mock_ticks(args.count, args.rate):
-        generated += 1
+    try:
+        print("Target rate:", f"{args.rate:,}", "orders/sec")
+        print("Orders to generate:", f"{args.count:,}")
+        print("Buffer capacity:", args.capacity)
 
-        if not args.quiet:
-            print(payload.hex())
+        generated, elapsed, throughput = await firehose_producer(
+            buffer,
+            args.count,
+            args.rate,
+            args.quiet
+        )
 
-    elapsed = time.perf_counter() - start
-    actual_rate = generated / elapsed if elapsed > 0 else 0
+        stored_orders = buffer.read_all()
 
-    print(f"\nGenerated: {generated:,} ticks")
-    print(f"Elapsed: {elapsed:.4f} seconds")
-    print(f"Actual throughput: {actual_rate:,.0f} ticks/sec")
+        print("\n--- Producer Results ---")
+        print("Generated:", generated)
+        print(f"Elapsed: {elapsed:.4f} seconds")
+        print(f"Throughput: {throughput:,.0f} orders/sec")
+        print("Stored in buffer:", len(stored_orders))
+        print("Unread orders:", buffer.unread_count)
+
+        if stored_orders:
+            print("First stored order:", stored_orders[0])
+            print("Last stored order:", stored_orders[-1])
+
+        if generated == 0:
+            print("No orders generated.")
+        elif len(stored_orders) == min(generated, args.capacity):
+            print("Buffer verification: PASSED")
+        else:
+            print("Buffer verification: FAILED")
+
+    finally:
+        buffer.close()
 
 
 if __name__ == "__main__":
