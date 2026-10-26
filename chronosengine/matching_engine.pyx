@@ -1,3 +1,4 @@
+
 from libc.stdlib cimport malloc, free
 from .matching_engine cimport Order, OrderNode
 from math import isfinite
@@ -84,10 +85,13 @@ cdef class PriceLevelQueue:
         node.prev = NULL
         node.next = NULL
 
-        # Keep timestamp order; equal timestamps retain insertion order.
+        # Preserve timestamp priority; equal timestamps keep insertion order.
         current = self.tail
 
-        while current != NULL and current.order.timestamp > order.timestamp:
+        while (
+            current != NULL
+            and current.order.timestamp > order.timestamp
+        ):
             current = current.prev
 
         if current == NULL:
@@ -127,6 +131,31 @@ cdef class PriceLevelQueue:
 
         free(old_head)
 
+    cdef bint remove_order(self, unsigned long long order_id):
+        """Remove a specific active order from this price level."""
+        cdef OrderNode* current
+
+        current = self.head
+
+        while current != NULL:
+            if current.order.order_id == order_id:
+                if current.prev != NULL:
+                    current.prev.next = current.next
+                else:
+                    self.head = current.next
+
+                if current.next != NULL:
+                    current.next.prev = current.prev
+                else:
+                    self.tail = current.prev
+
+                free(current)
+                return True
+
+            current = current.next
+
+        return False
+
     cdef bint is_empty(self):
         return self.head == NULL
 
@@ -145,6 +174,80 @@ cdef class MatchingEngine:
         self._trades = []
         self._seen_order_ids = set()
 
+    def insert_order(
+        self,
+        unsigned long long order_id,
+        side,
+        double price,
+        unsigned int quantity,
+        unsigned long long timestamp,
+    ):
+        """Insert an order directly into the active book without matching."""
+        cdef Order incoming
+        cdef PriceLevelQueue queue
+
+        if side not in ("B", "S"):
+            raise ValueError("side must be 'B' (buy) or 'S' (sell)")
+
+        if not isfinite(price) or price <= 0:
+            raise ValueError("price must be a finite positive number")
+
+        if quantity == 0:
+            raise ValueError("quantity must be greater than zero")
+
+        if order_id in self._seen_order_ids:
+            raise ValueError("order_id has already been used")
+
+        incoming.order_id = order_id
+        incoming.side = 66 if side == "B" else 83
+        incoming.price = price
+        incoming.quantity = quantity
+        incoming.timestamp = timestamp
+
+        if side == "B":
+            if price not in self._buys:
+                self._buys[price] = PriceLevelQueue()
+
+            queue = <PriceLevelQueue>self._buys[price]
+        else:
+            if price not in self._sells:
+                self._sells[price] = PriceLevelQueue()
+
+            queue = <PriceLevelQueue>self._sells[price]
+
+        queue.add_order(incoming)
+        self._seen_order_ids.add(order_id)
+
+        return True
+
+    def cancel_order(self, unsigned long long order_id):
+        """Cancel an active order. Return True if cancelled, otherwise False."""
+        cdef double price
+        cdef PriceLevelQueue queue
+
+        # Search active buy orders.
+        for price in list(self._buys.keys()):
+            queue = <PriceLevelQueue>self._buys[price]
+
+            if queue.remove_order(order_id):
+                if queue.is_empty():
+                    del self._buys[price]
+
+                return True
+
+        # Search active sell orders.
+        for price in list(self._sells.keys()):
+            queue = <PriceLevelQueue>self._sells[price]
+
+            if queue.remove_order(order_id):
+                if queue.is_empty():
+                    del self._sells[price]
+
+                return True
+
+        # The order may already have been filled or cancelled.
+        return False
+
     def submit_order(
         self,
         unsigned long long order_id,
@@ -153,6 +256,7 @@ cdef class MatchingEngine:
         unsigned int quantity,
         unsigned long long timestamp,
     ):
+        """Submit an order and match it against the opposite side."""
         cdef char side_code
         cdef unsigned int original_quantity
         cdef unsigned int remaining
@@ -182,7 +286,7 @@ cdef class MatchingEngine:
         self._seen_order_ids.add(order_id)
 
         if side == "B":
-            # Incoming buy matches the lowest-priced sell first.
+            # Match the lowest-priced sell orders first.
             while remaining > 0 and self._sells:
                 best_price = min(self._sells.keys())
 
@@ -220,7 +324,7 @@ cdef class MatchingEngine:
                     del self._sells[best_price]
 
         else:
-            # Incoming sell matches the highest-priced buy first.
+            # Match the highest-priced buy orders first.
             while remaining > 0 and self._buys:
                 best_price = max(self._buys.keys())
 
@@ -257,7 +361,7 @@ cdef class MatchingEngine:
                 if queue.is_empty():
                     del self._buys[best_price]
 
-        # Put any unfilled quantity into its own side's price level.
+        # Add any remaining quantity to the appropriate side.
         if remaining > 0:
             incoming.order_id = order_id
             incoming.side = side_code
