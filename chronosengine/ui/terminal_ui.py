@@ -1,4 +1,5 @@
 
+
 import curses
 import time
 from collections import deque
@@ -54,11 +55,15 @@ def draw_layout(stdscr, order_book=None, ops=0):
     height, width = stdscr.getmaxyx()
 
     safe_addstr(
-        stdscr, 0, 0,
+        stdscr,
+        0,
+        0,
         " ChronosEngine - Matching Engine Dashboard ",
     )
     safe_addstr(
-        stdscr, 1, 2,
+        stdscr,
+        1,
+        2,
         f"ORDERS/SEC (OPS): {ops}",
     )
 
@@ -84,29 +89,39 @@ def draw_layout(stdscr, order_book=None, ops=0):
         bid_text = (
             f"{best_bid['price']:.2f} "
             f"(Qty: {best_bid['quantity']})"
-            if best_bid else "--"
+            if best_bid
+            else "--"
         )
         ask_text = (
             f"{best_ask['price']:.2f} "
             f"(Qty: {best_ask['quantity']})"
-            if best_ask else "--"
+            if best_ask
+            else "--"
         )
 
         safe_addstr(
-            stdscr, 3, 2,
+            stdscr,
+            3,
+            2,
             f"BEST BID: {bid_text}    |    BEST ASK: {ask_text}",
         )
 
         safe_addstr(
-            stdscr, 5, 2,
+            stdscr,
+            5,
+            2,
             f"ORDER BOOK DEPTH - TOP {DEPTH_LEVELS} LEVELS",
         )
         safe_addstr(stdscr, 6, 2, "-" * min(width - 4, 60))
+
         safe_addstr(
-            stdscr, 7, 2,
+            stdscr,
+            7,
+            2,
             f"{'BID PRICE':>12} {'BID QTY':>9}  |  "
             f"{'ASK PRICE':>12} {'ASK QTY':>9}",
         )
+
         safe_addstr(stdscr, 8, 2, "-" * min(width - 4, 60))
 
         visible_levels = min(DEPTH_LEVELS, max(0, height - 10))
@@ -120,29 +135,37 @@ def draw_layout(stdscr, order_book=None, ops=0):
 
                 bid_price = (
                     f"{bid['price']:>12.2f}"
-                    if bid else f"{'--':>12}"
+                    if bid
+                    else f"{'--':>12}"
                 )
                 bid_qty = (
                     f"{bid['quantity']:>9}"
-                    if bid else f"{'--':>9}"
+                    if bid
+                    else f"{'--':>9}"
                 )
                 ask_price = (
                     f"{ask['price']:>12.2f}"
-                    if ask else f"{'--':>12}"
+                    if ask
+                    else f"{'--':>12}"
                 )
                 ask_qty = (
                     f"{ask['quantity']:>9}"
-                    if ask else f"{'--':>9}"
+                    if ask
+                    else f"{'--':>9}"
                 )
 
                 safe_addstr(
-                    stdscr, 9 + level, 2,
+                    stdscr,
+                    9 + level,
+                    2,
                     f"{bid_price} {bid_qty}  |  "
                     f"{ask_price} {ask_qty}",
                 )
     else:
         safe_addstr(
-            stdscr, 2, 0,
+            stdscr,
+            2,
+            0,
             "Enlarge terminal to at least 64 columns and 12 rows.",
         )
 
@@ -153,7 +176,7 @@ def draw_layout(stdscr, order_book=None, ops=0):
 
 
 def main(stdscr, engine=None):
-    """Run the dashboard and estimate observed orders per second."""
+    """Run the dashboard and handle terminal resize events."""
     if engine is None:
         engine = MatchingEngine()
 
@@ -187,11 +210,24 @@ def main(stdscr, engine=None):
 
         ops = len(recent_order_times)
 
+        # Draw the dashboard using the current terminal dimensions.
         draw_layout(stdscr, order_book, ops)
 
         key = stdscr.getch()
+
         if key in (ord("q"), ord("Q")):
             break
+
+        # Handle terminal resize events and redraw the screen.
+        if key == curses.KEY_RESIZE:
+            if hasattr(curses, "update_lines_cols"):
+                curses.update_lines_cols()
+
+            stdscr.clearok(True)
+            stdscr.erase()
+
+            # draw_layout() redraws using the new terminal dimensions.
+            draw_layout(stdscr, order_book, ops)
 
 
 if __name__ == "__main__":
