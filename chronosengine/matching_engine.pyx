@@ -4,6 +4,21 @@ from .matching_engine cimport Order, OrderNode
 from math import isfinite
 
 
+cdef unsigned int _apply_fill(
+    OrderNode* maker,
+    unsigned int remaining,
+) noexcept nogil:
+    cdef unsigned int trade_quantity
+
+    if remaining < maker.order.quantity:
+        trade_quantity = remaining
+    else:
+        trade_quantity = maker.order.quantity
+
+    maker.order.quantity -= trade_quantity
+    return trade_quantity
+
+
 cdef class OrderBookNode:
     cdef OrderNode* node
 
@@ -225,7 +240,6 @@ cdef class MatchingEngine:
         cdef double price
         cdef PriceLevelQueue queue
 
-        # Search active buy orders.
         for price in list(self._buys.keys()):
             queue = <PriceLevelQueue>self._buys[price]
 
@@ -235,7 +249,6 @@ cdef class MatchingEngine:
 
                 return True
 
-        # Search active sell orders.
         for price in list(self._sells.keys()):
             queue = <PriceLevelQueue>self._sells[price]
 
@@ -245,7 +258,6 @@ cdef class MatchingEngine:
 
                 return True
 
-        # The order may already have been filled or cancelled.
         return False
 
     def submit_order(
@@ -300,6 +312,7 @@ cdef class MatchingEngine:
                     del self._sells[best_price]
                     continue
 
+                # Record the trade before modifying the maker order.
                 trade_quantity = (
                     remaining
                     if remaining < maker.order.quantity
@@ -314,8 +327,10 @@ cdef class MatchingEngine:
                     "timestamp": timestamp,
                 })
 
+                with nogil:
+                    trade_quantity = _apply_fill(maker, remaining)
+
                 remaining -= trade_quantity
-                maker.order.quantity -= trade_quantity
 
                 if maker.order.quantity == 0:
                     queue.pop_head()
@@ -352,8 +367,10 @@ cdef class MatchingEngine:
                     "timestamp": timestamp,
                 })
 
+                with nogil:
+                    trade_quantity = _apply_fill(maker, remaining)
+
                 remaining -= trade_quantity
-                maker.order.quantity -= trade_quantity
 
                 if maker.order.quantity == 0:
                     queue.pop_head()
@@ -361,7 +378,6 @@ cdef class MatchingEngine:
                 if queue.is_empty():
                     del self._buys[best_price]
 
-        # Add any remaining quantity to the appropriate side.
         if remaining > 0:
             incoming.order_id = order_id
             incoming.side = side_code
