@@ -5,7 +5,7 @@ import time
 import argparse
 
 from mmap_ringbuffer import MMapRingBuffer
-
+from order_schema import ORDER_STRUCT
 
 async def generate_mock_orders(
     count=10,
@@ -80,6 +80,7 @@ async def generate_mock_orders(
             await asyncio.sleep(0)
 
 
+
 async def firehose_producer(
     buffer,
     count,
@@ -90,10 +91,14 @@ async def firehose_producer(
     burst_duration=5.0,
     news_delay=1.0,
 ):
-    """Generate orders asynchronously and write them to the mmap buffer."""
+    """Generate orders into a reusable pre-allocated binary buffer."""
 
     start = time.perf_counter()
     generated = 0
+
+    # Reuse the same memory for every generated order.
+    payload = bytearray(ORDER_STRUCT.size)
+    side_codes = (b"B", b"S")
 
     async for order in generate_mock_orders(
         count=count,
@@ -103,7 +108,17 @@ async def firehose_producer(
         burst_duration=burst_duration,
         news_delay=news_delay,
     ):
-        buffer.push(order)
+        ORDER_STRUCT.pack_into(
+            payload,
+            0,
+            order["order_id"],
+            order["side"].encode("ascii"),
+            order["price"],
+            order["quantity"],
+            order["timestamp"],
+        )
+
+        buffer.push_packed(payload)
         generated += 1
 
         if not quiet:
@@ -114,64 +129,24 @@ async def firehose_producer(
 
     return generated, elapsed, throughput
 
-
 async def main():
     parser = argparse.ArgumentParser(
         description="Async order producer with optional earnings-news burst"
     )
 
-    parser.add_argument(
-        "--count",
-        type=int,
-        default=100_000,
-        help="Number of orders to generate",
-    )
-    parser.add_argument(
-        "--rate",
-        type=int,
-        default=100_000,
-        help="Normal target orders per second",
-    )
-    parser.add_argument(
-        "--capacity",
-        type=int,
-        default=100,
-        help="Maximum number of orders stored in the buffer",
-    )
-    parser.add_argument(
-        "--buffer",
-        default="orders_buffer.dat",
-        help="Mmap buffer file path",
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress individual order output",
-    )
+    parser.add_argument("--count", type=int, default=100_000)
+    parser.add_argument("--rate", type=int, default=100_000)
+    parser.add_argument("--capacity", type=int, default=100)
+    parser.add_argument("--buffer", default="orders_buffer.dat")
+    parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
         "--news-profile",
         choices=("none", "earnings"),
         default="none",
-        help="Select normal generation or simulated earnings-news burst",
     )
-    parser.add_argument(
-        "--burst-rate",
-        type=int,
-        default=None,
-        help="Orders per second during the burst (default: 5x normal rate)",
-    )
-    parser.add_argument(
-        "--burst-duration",
-        type=float,
-        default=5.0,
-        help="Duration of the earnings-news burst in seconds",
-    )
-    parser.add_argument(
-        "--news-delay",
-        type=float,
-        default=1.0,
-        help="Seconds after generation starts before earnings news",
-    )
+    parser.add_argument("--burst-rate", type=int, default=None)
+    parser.add_argument("--burst-duration", type=float, default=5.0)
+    parser.add_argument("--news-delay", type=float, default=1.0)
 
     args = parser.parse_args()
 

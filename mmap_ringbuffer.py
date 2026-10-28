@@ -29,7 +29,6 @@ class MMapRingBuffer:
 
         self.mm = mmap.mmap(self.file.fileno(), self.file_size)
 
-        # write_index, item_count, read_index, unread_count
         self.HEADER.pack_into(self.mm, 0, 0, 0, 0, 0)
 
     def _get_state(self):
@@ -45,15 +44,12 @@ class MMapRingBuffer:
         """Number of records waiting for the consumer."""
         return self._get_state()[3]
 
-    def push(self, order):
-        """Write an order and overwrite the oldest slot when full."""
-        record = pack_order(
-            order["order_id"],
-            order["side"],
-            order["price"],
-            order["quantity"],
-            order["timestamp"],
-        )
+    def _write_record(self, record):
+        """Write one packed record and update ring-buffer metadata."""
+        if len(record) != self.record_size:
+            raise ValueError(
+                f"Record must be {self.record_size} bytes"
+            )
 
         write_index, item_count, read_index, unread_count = (
             self._get_state()
@@ -62,8 +58,6 @@ class MMapRingBuffer:
         offset = self.header_size + write_index * self.record_size
         self.mm[offset:offset + self.record_size] = record
 
-        # If full, the write slot contains the oldest stored record.
-        # If it is also the next unread record, that record is lost.
         if item_count == self.capacity:
             if unread_count > 0 and read_index == write_index:
                 read_index = (read_index + 1) % self.capacity
@@ -82,7 +76,22 @@ class MMapRingBuffer:
             read_index,
             unread_count,
         )
+
+    def push(self, order):
+        """Write a dictionary order using the existing API."""
+        record = pack_order(
+            order["order_id"],
+            order["side"],
+            order["price"],
+            order["quantity"],
+            order["timestamp"],
+        )
+        self._write_record(record)
         self.mm.flush()
+
+    def push_packed(self, record):
+        """Write an already-packed record without repacking it."""
+        self._write_record(record)
 
     def read_next_view(self):
         """
@@ -149,8 +158,13 @@ class MMapRingBuffer:
         return orders
 
     def close(self):
-        self.mm.close()
-        self.file.close()
+        """Flush pending changes and close mmap and file."""
+        if not self.mm.closed:
+            self.mm.flush()
+            self.mm.close()
+
+        if not self.file.closed:
+            self.file.close()
 
 
 if __name__ == "__main__":
