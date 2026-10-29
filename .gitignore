@@ -218,3 +218,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ChronosEngine generated files and local test data
+chronosengine/matching_engine.cpp
+*.dat
+*.dat.lock
+
+# Local backups
+*_backup.py
+*_backup_*.py
+terminal_ui_before_scroll.py
+terminal_ui_conflict_backup.py
+terminal_ui_member4_original.py
+terminal_ui_trade_window_version.py
