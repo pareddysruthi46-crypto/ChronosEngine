@@ -28,7 +28,6 @@ class MMapRingBuffer:
         self.file.flush()
 
         self.mm = mmap.mmap(self.file.fileno(), self.file_size)
-
         self.HEADER.pack_into(self.mm, 0, 0, 0, 0, 0)
 
     def _get_state(self):
@@ -78,13 +77,14 @@ class MMapRingBuffer:
         )
 
     def push(self, order):
-        """Write a dictionary order using the existing API."""
+        """Write a dictionary order, including its order type."""
         record = pack_order(
             order["order_id"],
             order["side"],
             order["price"],
             order["quantity"],
             order["timestamp"],
+            order.get("order_type", "LIMIT"),
         )
         self._write_record(record)
         self.mm.flush()
@@ -92,6 +92,7 @@ class MMapRingBuffer:
     def push_packed(self, record):
         """Write an already-packed record without repacking it."""
         self._write_record(record)
+        self.mm.flush()
 
     def read_next_view(self):
         """
@@ -168,31 +169,47 @@ class MMapRingBuffer:
 
 
 if __name__ == "__main__":
-    buffer = MMapRingBuffer("orders_buffer.dat", capacity=3)
+    buffer = MMapRingBuffer("orders_buffer_test.dat", capacity=3)
 
     try:
-        for order_id in range(1001, 1005):
-            buffer.push({
-                "order_id": order_id,
-                "side": "B" if order_id % 2 else "S",
-                "price": 125.50 + order_id - 1001,
+        test_orders = [
+            {
+                "order_id": 1001,
+                "side": "B",
+                "price": 125.50,
                 "quantity": 10,
-                "timestamp": 1720000000000 + order_id,
-            })
+                "timestamp": 1720000000001,
+                "order_type": "MARKET",
+            },
+            {
+                "order_id": 1002,
+                "side": "S",
+                "price": 126.50,
+                "quantity": 20,
+                "timestamp": 1720000000002,
+                "order_type": "LIMIT",
+            },
+            {
+                "order_id": 1003,
+                "side": "B",
+                "price": 127.50,
+                "quantity": 30,
+                "timestamp": 1720000000003,
+                "order_type": "IOC",
+            },
+        ]
 
-        print("Stored orders:", buffer.read_all())
+        for order in test_orders:
+            buffer.push(order)
+
+        print("Stored orders:")
+        for order in buffer.read_all():
+            print(order)
+
         print("Unread count:", buffer.unread_count)
-
         print("Consume one order:", buffer.read_next())
         print("Read cursor:", buffer.read_index)
         print("Remaining unread:", buffer.unread_count)
-
-        view = buffer.read_next_view()
-        if view is not None:
-            try:
-                print("Zero-copy record:", bytes(view))
-            finally:
-                view.release()
 
     finally:
         buffer.close()

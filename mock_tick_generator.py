@@ -7,6 +7,14 @@ import argparse
 from mmap_ringbuffer import MMapRingBuffer
 from order_schema import ORDER_STRUCT
 
+
+ORDER_TYPE_CODES = {
+    "MARKET": b"M",
+    "LIMIT": b"L",
+    "IOC": b"I",
+}
+
+
 async def generate_mock_orders(
     count=10,
     rate=100_000,
@@ -15,7 +23,7 @@ async def generate_mock_orders(
     burst_duration=5.0,
     news_delay=1.0,
 ):
-    """Generate orders with an optional earnings-news volume burst."""
+    """Generate diverse orders with an optional earnings-news burst."""
 
     if count < 0:
         raise ValueError("count must be >= 0")
@@ -66,6 +74,11 @@ async def generate_mock_orders(
             "price": round(random.uniform(100, 250), 2),
             "quantity": random.randint(1, 1000),
             "timestamp": time.time_ns(),
+            "order_type": random.choices(
+                ["MARKET", "LIMIT", "IOC"],
+                weights=[20, 60, 20],
+                k=1,
+            )[0],
         }
 
         yield order
@@ -76,9 +89,7 @@ async def generate_mock_orders(
         if remaining > 0:
             await asyncio.sleep(remaining)
         else:
-            # Yield control to other asynchronous tasks.
             await asyncio.sleep(0)
-
 
 
 async def firehose_producer(
@@ -96,9 +107,8 @@ async def firehose_producer(
     start = time.perf_counter()
     generated = 0
 
-    # Reuse the same memory for every generated order.
+    # Allocate the correct size for the six-field binary record.
     payload = bytearray(ORDER_STRUCT.size)
-    side_codes = (b"B", b"S")
 
     async for order in generate_mock_orders(
         count=count,
@@ -116,6 +126,7 @@ async def firehose_producer(
             order["price"],
             order["quantity"],
             order["timestamp"],
+            ORDER_TYPE_CODES[order["order_type"]],
         )
 
         buffer.push_packed(payload)
@@ -129,9 +140,13 @@ async def firehose_producer(
 
     return generated, elapsed, throughput
 
+
 async def main():
     parser = argparse.ArgumentParser(
-        description="Async order producer with optional earnings-news burst"
+        description=(
+            "Async order producer with order types "
+            "and optional earnings-news burst"
+        )
     )
 
     parser.add_argument("--count", type=int, default=100_000)
