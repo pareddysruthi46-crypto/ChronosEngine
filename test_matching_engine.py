@@ -111,3 +111,24 @@ assert first_result[1]["buys"] == []
 print("PASS: Matching results are deterministic")
 
 print("All matching tests passed!")
+
+# Test 8: Incoming order remainder persists after a partial fill.
+engine = MatchingEngine()
+engine.submit_order(501, "S", 100, 3, 1)
+
+result = engine.submit_order(502, "B", 100, 5, 2)
+
+assert result["filled_quantity"] == 3
+assert result["remaining_quantity"] == 2
+
+book = engine.get_order_book()
+assert len(book["buys"]) == 1
+assert book["buys"][0]["order_id"] == 502
+assert book["buys"][0]["quantity"] == 2
+assert book["sells"] == []
+
+trades = engine.get_trades()
+assert len(trades) == 1
+assert trades[0]["quantity"] == 3
+
+print("PASS: Incoming order remainder persists after partial fill")
