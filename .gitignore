@@ -5,6 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
+# Generated Cython C++ files
+chronosengine/*.cpp
 
 # Distribution / packaging
 .Python
