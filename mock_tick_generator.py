@@ -1,4 +1,3 @@
-
 import asyncio
 import random
 import time
@@ -73,7 +72,8 @@ async def generate_mock_orders(
             "side": random.choice(["B", "S"]),
             "price": round(random.uniform(100, 250), 2),
             "quantity": random.randint(1, 1000),
-            "timestamp": time.time_ns(),
+            # Timestamp is injected later at binary packet creation.
+            "timestamp": 0,
             "order_type": random.choices(
                 ["MARKET", "LIMIT", "IOC"],
                 weights=[20, 60, 20],
@@ -102,12 +102,12 @@ async def firehose_producer(
     burst_duration=5.0,
     news_delay=1.0,
 ):
-    """Generate orders into a reusable pre-allocated binary buffer."""
+    """Generate orders and inject ingress timestamps during binary packing."""
 
     start = time.perf_counter()
     generated = 0
 
-    # Allocate the correct size for the six-field binary record.
+    # Reusable pre-allocated binary payload.
     payload = bytearray(ORDER_STRUCT.size)
 
     async for order in generate_mock_orders(
@@ -118,6 +118,10 @@ async def firehose_producer(
         burst_duration=burst_duration,
         news_delay=news_delay,
     ):
+
+        # Capture timestamp immediately before binary packet creation.
+        ingress_timestamp_ns = time.time_ns()
+
         ORDER_STRUCT.pack_into(
             payload,
             0,
@@ -125,11 +129,13 @@ async def firehose_producer(
             order["side"].encode("ascii"),
             order["price"],
             order["quantity"],
-            order["timestamp"],
+            ingress_timestamp_ns,
             ORDER_TYPE_CODES[order["order_type"]],
         )
 
+        # Write the already-packed binary packet into the ring buffer.
         buffer.push_packed(payload)
+
         generated += 1
 
         if not quiet:
@@ -154,11 +160,13 @@ async def main():
     parser.add_argument("--capacity", type=int, default=100)
     parser.add_argument("--buffer", default="orders_buffer.dat")
     parser.add_argument("--quiet", action="store_true")
+
     parser.add_argument(
         "--news-profile",
         choices=("none", "earnings"),
         default="none",
     )
+
     parser.add_argument("--burst-rate", type=int, default=None)
     parser.add_argument("--burst-duration", type=float, default=5.0)
     parser.add_argument("--news-delay", type=float, default=1.0)
@@ -184,7 +192,10 @@ async def main():
         else args.rate * 5
     )
 
-    buffer = MMapRingBuffer(args.buffer, capacity=args.capacity)
+    buffer = MMapRingBuffer(
+        args.buffer,
+        capacity=args.capacity,
+    )
 
     try:
         print("Normal target rate:", f"{args.rate:,}", "orders/sec")
