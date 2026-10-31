@@ -1,5 +1,7 @@
 
 from libc.stdlib cimport malloc, free
+from libc.string cimport memcpy
+from libc.stdint cimport uint64_t, uint32_t
 from .matching_engine cimport Order, OrderNode
 from math import isfinite
 
@@ -312,7 +314,6 @@ cdef class MatchingEngine:
                     del self._sells[best_price]
                     continue
 
-                # Record the trade before modifying the maker order.
                 trade_quantity = (
                     remaining
                     if remaining < maker.order.quantity
@@ -406,6 +407,100 @@ cdef class MatchingEngine:
             "filled_quantity": filled,
             "remaining_quantity": remaining,
         }
+
+    def consume_mmap(self, ring_buffer, unsigned int max_orders=0):
+        """
+        Read binary orders directly from the original mmap memory.
+
+        max_orders=0 means consume all currently available orders.
+        The ring-buffer lock is held until each order is processed
+        and acknowledged.
+        """
+        cdef const unsigned char[:] mapped = ring_buffer.mm
+
+        cdef uint64_t order_id
+        cdef uint64_t timestamp
+        cdef uint32_t quantity
+        cdef char side_code
+        cdef double price
+
+        cdef unsigned int processed = 0
+        cdef unsigned int write_index
+        cdef unsigned int item_count
+        cdef unsigned int read_index
+        cdef unsigned int unread_count
+        cdef unsigned int next_read_index
+        cdef uint64_t sequence_number
+
+        cdef Py_ssize_t offset
+        cdef tuple state
+
+        if ring_buffer.record_size != 29:
+            raise ValueError("Unexpected mmap record size")
+
+        if max_orders == 0:
+            max_orders = 0xFFFFFFFF
+
+        while processed < max_orders:
+
+            with ring_buffer._locked():
+
+                state = ring_buffer._get_state()
+
+                (
+                    write_index,
+                    item_count,
+                    read_index,
+                    unread_count,
+                    sequence_number,
+                ) = state
+
+                if unread_count == 0:
+                    break
+
+                offset = (
+                    ring_buffer.header_size
+                    + read_index * ring_buffer.record_size
+                )
+
+                # Decode directly from the original mmap bytes.
+                memcpy(&order_id, &mapped[offset], 8)
+                memcpy(&side_code, &mapped[offset + 8], 1)
+                memcpy(&price, &mapped[offset + 9], 8)
+                memcpy(&quantity, &mapped[offset + 17], 4)
+                memcpy(&timestamp, &mapped[offset + 21], 8)
+
+                if side_code != 66 and side_code != 83:
+                    raise ValueError("Invalid side byte in mmap record")
+
+                # Match the order before acknowledging it.
+                self.submit_order(
+                    order_id,
+                    chr(side_code),
+                    price,
+                    quantity,
+                    timestamp,
+                )
+
+                next_read_index = (
+                    read_index + 1
+                ) % ring_buffer.capacity
+
+                ring_buffer.HEADER.pack_into(
+                    ring_buffer.mm,
+                    0,
+                    write_index,
+                    item_count,
+                    next_read_index,
+                    unread_count - 1,
+                    sequence_number + 1,
+                )
+
+                ring_buffer.mm.flush()
+
+                processed += 1
+
+        return processed
 
     cdef list _get_side_orders(self, dict levels, bint descending):
         cdef list result = []
