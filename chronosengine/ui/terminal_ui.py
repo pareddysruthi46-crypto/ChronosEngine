@@ -1,5 +1,5 @@
 
-
+import argparse
 import curses
 import time
 from collections import deque
@@ -11,23 +11,46 @@ REFRESH_INTERVAL_MS = 250
 OPS_WINDOW_SECONDS = 1.0
 
 
-def safe_addstr(stdscr, y, x, text):
-    """Write text without exceeding terminal boundaries."""
-    height, width = stdscr.getmaxyx()
+def parse_args(args=None):
+    parser = argparse.ArgumentParser(
+        description="ChronosEngine terminal matching engine dashboard"
+    )
+    parser.add_argument(
+        "--refresh-ms", type=int, default=250,
+        help="Dashboard refresh interval in milliseconds (default: 250)"
+    )
+    parser.add_argument(
+        "--depth-levels", type=int, default=5,
+        help="Number of order book levels to display (default: 5)"
+    )
+    parser.add_argument(
+        "--ops-window", type=float, default=1.0,
+        help="OPS measurement window in seconds (default: 1.0)"
+    )
 
+    options = parser.parse_args(args)
+
+    if options.refresh_ms <= 0:
+        parser.error("--refresh-ms must be greater than zero")
+    if options.depth_levels <= 0:
+        parser.error("--depth-levels must be greater than zero")
+    if options.ops_window <= 0:
+        parser.error("--ops-window must be greater than zero")
+
+    return options
+
+
+def safe_addstr(stdscr, y, x, text):
+    height, width = stdscr.getmaxyx()
     if y < 0 or y >= height or x < 0 or x >= width - 1:
         return
-
-    available = width - x - 1
-
     try:
-        stdscr.addnstr(y, x, str(text), available)
+        stdscr.addnstr(y, x, str(text), width - x - 1)
     except curses.error:
         pass
 
 
 def get_observed_order_ids(order_book, trades):
-    """Collect order IDs visible in the book and completed trades."""
     order_ids = set()
 
     for side in ("buys", "sells"):
@@ -37,15 +60,13 @@ def get_observed_order_ids(order_book, trades):
     for trade in trades:
         if "buy_order_id" in trade:
             order_ids.add(trade["buy_order_id"])
-
         if "sell_order_id" in trade:
             order_ids.add(trade["sell_order_id"])
 
     return order_ids
 
 
-def draw_layout(stdscr, order_book=None, ops=0):
-    """Render the order book and live throughput metric."""
+def draw_layout(stdscr, order_book=None, ops=0, depth_levels=DEPTH_LEVELS):
     try:
         curses.curs_set(0)
     except curses.error:
@@ -54,18 +75,8 @@ def draw_layout(stdscr, order_book=None, ops=0):
     stdscr.erase()
     height, width = stdscr.getmaxyx()
 
-    safe_addstr(
-        stdscr,
-        0,
-        0,
-        " ChronosEngine - Matching Engine Dashboard ",
-    )
-    safe_addstr(
-        stdscr,
-        1,
-        2,
-        f"ORDERS/SEC (OPS): {ops}",
-    )
+    safe_addstr(stdscr, 0, 0, " ChronosEngine - Matching Engine Dashboard ")
+    safe_addstr(stdscr, 1, 2, f"ORDERS/SEC (OPS): {ops}")
 
     if order_book is None:
         order_book = {"buys": [], "sells": []}
@@ -87,44 +98,31 @@ def draw_layout(stdscr, order_book=None, ops=0):
         safe_addstr(stdscr, 2, 2, "TOP OF BOOK")
 
         bid_text = (
-            f"{best_bid['price']:.2f} "
-            f"(Qty: {best_bid['quantity']})"
-            if best_bid
-            else "--"
+            f"{best_bid['price']:.2f} (Qty: {best_bid['quantity']})"
+            if best_bid else "--"
         )
         ask_text = (
-            f"{best_ask['price']:.2f} "
-            f"(Qty: {best_ask['quantity']})"
-            if best_ask
-            else "--"
+            f"{best_ask['price']:.2f} (Qty: {best_ask['quantity']})"
+            if best_ask else "--"
         )
 
         safe_addstr(
-            stdscr,
-            3,
-            2,
+            stdscr, 3, 2,
             f"BEST BID: {bid_text}    |    BEST ASK: {ask_text}",
         )
-
         safe_addstr(
-            stdscr,
-            5,
-            2,
-            f"ORDER BOOK DEPTH - TOP {DEPTH_LEVELS} LEVELS",
+            stdscr, 5, 2,
+            f"ORDER BOOK DEPTH - TOP {depth_levels} LEVELS",
         )
         safe_addstr(stdscr, 6, 2, "-" * min(width - 4, 60))
-
         safe_addstr(
-            stdscr,
-            7,
-            2,
+            stdscr, 7, 2,
             f"{'BID PRICE':>12} {'BID QTY':>9}  |  "
             f"{'ASK PRICE':>12} {'ASK QTY':>9}",
         )
-
         safe_addstr(stdscr, 8, 2, "-" * min(width - 4, 60))
 
-        visible_levels = min(DEPTH_LEVELS, max(0, height - 10))
+        visible_levels = min(depth_levels, max(0, height - 10))
 
         if not bids and not asks:
             safe_addstr(stdscr, 9, 2, "Order book is empty.")
@@ -133,39 +131,18 @@ def draw_layout(stdscr, order_book=None, ops=0):
                 bid = bids[level] if level < len(bids) else None
                 ask = asks[level] if level < len(asks) else None
 
-                bid_price = (
-                    f"{bid['price']:>12.2f}"
-                    if bid
-                    else f"{'--':>12}"
-                )
-                bid_qty = (
-                    f"{bid['quantity']:>9}"
-                    if bid
-                    else f"{'--':>9}"
-                )
-                ask_price = (
-                    f"{ask['price']:>12.2f}"
-                    if ask
-                    else f"{'--':>12}"
-                )
-                ask_qty = (
-                    f"{ask['quantity']:>9}"
-                    if ask
-                    else f"{'--':>9}"
-                )
+                bid_price = f"{bid['price']:>12.2f}" if bid else f"{'--':>12}"
+                bid_qty = f"{bid['quantity']:>9}" if bid else f"{'--':>9}"
+                ask_price = f"{ask['price']:>12.2f}" if ask else f"{'--':>12}"
+                ask_qty = f"{ask['quantity']:>9}" if ask else f"{'--':>9}"
 
                 safe_addstr(
-                    stdscr,
-                    9 + level,
-                    2,
-                    f"{bid_price} {bid_qty}  |  "
-                    f"{ask_price} {ask_qty}",
+                    stdscr, 9 + level, 2,
+                    f"{bid_price} {bid_qty}  |  {ask_price} {ask_qty}",
                 )
     else:
         safe_addstr(
-            stdscr,
-            2,
-            0,
+            stdscr, 2, 0,
             "Enlarge terminal to at least 64 columns and 12 rows.",
         )
 
@@ -175,60 +152,58 @@ def draw_layout(stdscr, order_book=None, ops=0):
     stdscr.refresh()
 
 
-def main(stdscr, engine=None):
-    """Run the dashboard and handle terminal resize events."""
+def main(stdscr, engine=None, options=None):
     if engine is None:
         engine = MatchingEngine()
 
-    # Refresh automatically, even when no key is pressed.
-    stdscr.timeout(REFRESH_INTERVAL_MS)
+    if options is None:
+        options = parse_args([])
+
+    stdscr.timeout(options.refresh_ms)
 
     seen_order_ids = set()
     recent_order_times = deque()
 
     while True:
         now = time.monotonic()
-
         order_book = engine.get_order_book()
         trades = engine.get_trades()
 
         observed_ids = get_observed_order_ids(order_book, trades)
-
-        # Count each order ID only the first time it becomes observable.
         new_order_ids = observed_ids - seen_order_ids
         seen_order_ids.update(new_order_ids)
 
         for _ in new_order_ids:
             recent_order_times.append(now)
 
-        # Keep only orders observed during the last second.
         while (
             recent_order_times
-            and now - recent_order_times[0] >= OPS_WINDOW_SECONDS
+            and now - recent_order_times[0] >= options.ops_window
         ):
             recent_order_times.popleft()
 
-        ops = len(recent_order_times)
+        ops = int(len(recent_order_times) / options.ops_window)
 
-        # Draw the dashboard using the current terminal dimensions.
-        draw_layout(stdscr, order_book, ops)
+        draw_layout(stdscr, order_book, ops, options.depth_levels)
 
         key = stdscr.getch()
-
         if key in (ord("q"), ord("Q")):
             break
 
-        # Handle terminal resize events and redraw the screen.
         if key == curses.KEY_RESIZE:
             if hasattr(curses, "update_lines_cols"):
                 curses.update_lines_cols()
-
             stdscr.clearok(True)
             stdscr.erase()
 
-            # draw_layout() redraws using the new terminal dimensions.
-            draw_layout(stdscr, order_book, ops)
+
+def launch_dashboard(options, engine=None):
+    if engine is None:
+        engine = MatchingEngine()
+
+    curses.wrapper(lambda stdscr: main(stdscr, engine, options))
 
 
 if __name__ == "__main__":
-    curses.wrapper(main)
+    cli_options = parse_args()
+    launch_dashboard(cli_options)
