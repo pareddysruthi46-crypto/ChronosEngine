@@ -111,3 +111,71 @@ assert first_result[1]["buys"] == []
 print("PASS: Matching results are deterministic")
 
 print("All matching tests passed!")
+# Test 8: Direct insertion without matching.
+engine = MatchingEngine()
+assert engine.insert_order(501, "S", 105, 5, 1) is True
+assert engine.insert_order(502, "B", 95, 3, 2) is True
+
+book = engine.get_order_book()
+assert len(book["sells"]) == 1
+assert len(book["buys"]) == 1
+assert len(engine.get_trades()) == 0
+print("PASS: Direct insertion without matching")
+
+
+# Test 9: Cancel an order at the best price.
+engine = MatchingEngine()
+engine.insert_order(601, "S", 100, 5, 1)
+engine.insert_order(602, "S", 101, 4, 2)
+
+assert engine.cancel_order(601) is True
+
+book = engine.get_order_book()
+assert len(book["sells"]) == 1
+assert book["sells"][0]["order_id"] == 602
+assert book["sells"][0]["price"] == 101
+print("PASS: Cancel order at best price")
+
+
+# Test 10: Cancel the final order at a price level.
+engine = MatchingEngine()
+engine.insert_order(701, "B", 100, 5, 1)
+engine.insert_order(702, "B", 99, 4, 2)
+
+assert engine.cancel_order(701) is True
+
+book = engine.get_order_book()
+assert len(book["buys"]) == 1
+assert book["buys"][0]["order_id"] == 702
+assert book["buys"][0]["price"] == 99
+print("PASS: Remove empty price level after cancellation")
+
+
+# Test 11: Cancelling a nonexistent order.
+engine = MatchingEngine()
+engine.insert_order(801, "B", 100, 5, 1)
+
+assert engine.cancel_order(999) is False
+assert len(engine.get_order_book()["buys"]) == 1
+print("PASS: Nonexistent cancellation")
+
+
+# Test 12: Preserve FIFO priority after cancellation.
+engine = MatchingEngine()
+engine.insert_order(901, "B", 100, 5, 1)
+engine.insert_order(902, "B", 100, 4, 2)
+engine.insert_order(903, "B", 100, 3, 3)
+
+assert engine.cancel_order(902) is True
+
+engine.submit_order(904, "S", 100, 7, 4)
+trades = engine.get_trades()
+
+assert len(trades) == 2
+assert trades[0]["buy_order_id"] == 901
+assert trades[0]["quantity"] == 5
+assert trades[1]["buy_order_id"] == 903
+assert trades[1]["quantity"] == 2
+print("PASS: FIFO priority after cancellation")
+
+print("All insertion and cancellation tests passed!")

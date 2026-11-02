@@ -1,4 +1,3 @@
-
 from libc.stdlib cimport malloc, free
 from libc.string cimport memcpy
 from libc.stdint cimport uint64_t, uint32_t
@@ -67,7 +66,7 @@ cdef class OrderBookNode:
 
 
 cdef class PriceLevelQueue:
-    """Doubly-linked FIFO queue for orders at one price level."""
+    """Doubly-linked queue for orders at one price level."""
 
     cdef OrderNode* head
     cdef OrderNode* tail
@@ -184,12 +183,15 @@ cdef class MatchingEngine:
     cdef dict _sells
     cdef list _trades
     cdef set _seen_order_ids
+    cdef dict _active_orders
 
     def __cinit__(self):
         self._buys = {}
         self._sells = {}
         self._trades = []
         self._seen_order_ids = set()
+        # order_id -> (side, price); deliberately stores no raw C pointers.
+        self._active_orders = {}
 
     def insert_order(
         self,
@@ -224,43 +226,49 @@ cdef class MatchingEngine:
         if side == "B":
             if price not in self._buys:
                 self._buys[price] = PriceLevelQueue()
-
             queue = <PriceLevelQueue>self._buys[price]
         else:
             if price not in self._sells:
                 self._sells[price] = PriceLevelQueue()
-
             queue = <PriceLevelQueue>self._sells[price]
 
         queue.add_order(incoming)
+
+        self._active_orders[order_id] = (side, price)
         self._seen_order_ids.add(order_id)
 
         return True
 
     def cancel_order(self, unsigned long long order_id):
-        """Cancel an active order. Return True if cancelled, otherwise False."""
+        """Cancel an active order using the order-ID-to-price index."""
+        cdef object location
+        cdef object side
         cdef double price
         cdef PriceLevelQueue queue
 
-        for price in list(self._buys.keys()):
-            queue = <PriceLevelQueue>self._buys[price]
+        location = self._active_orders.get(order_id)
+        if location is None:
+            return False
 
+        side, price = location
+
+        if side == "B":
+            queue = <PriceLevelQueue>self._buys[price]
             if queue.remove_order(order_id):
                 if queue.is_empty():
                     del self._buys[price]
-
+                del self._active_orders[order_id]
                 return True
-
-        for price in list(self._sells.keys()):
+        else:
             queue = <PriceLevelQueue>self._sells[price]
-
             if queue.remove_order(order_id):
                 if queue.is_empty():
                     del self._sells[price]
-
+                del self._active_orders[order_id]
                 return True
 
-        return False
+        # An index/book mismatch indicates an internal consistency problem.
+        raise RuntimeError("Active-order index is inconsistent with the order book")
 
     def submit_order(
         self,
@@ -280,6 +288,7 @@ cdef class MatchingEngine:
         cdef OrderNode* maker
         cdef PriceLevelQueue queue
         cdef double best_price
+        cdef unsigned long long maker_order_id
 
         if side not in ("B", "S"):
             raise ValueError("side must be 'B' (buy) or 'S' (sell)")
@@ -314,6 +323,7 @@ cdef class MatchingEngine:
                     del self._sells[best_price]
                     continue
 
+                maker_order_id = maker.order.order_id
                 trade_quantity = (
                     remaining
                     if remaining < maker.order.quantity
@@ -322,7 +332,7 @@ cdef class MatchingEngine:
 
                 self._trades.append({
                     "buy_order_id": order_id,
-                    "sell_order_id": maker.order.order_id,
+                    "sell_order_id": maker_order_id,
                     "price": maker.order.price,
                     "quantity": trade_quantity,
                     "timestamp": timestamp,
@@ -334,6 +344,7 @@ cdef class MatchingEngine:
                 remaining -= trade_quantity
 
                 if maker.order.quantity == 0:
+                    self._active_orders.pop(maker_order_id, None)
                     queue.pop_head()
 
                 if queue.is_empty():
@@ -354,6 +365,7 @@ cdef class MatchingEngine:
                     del self._buys[best_price]
                     continue
 
+                maker_order_id = maker.order.order_id
                 trade_quantity = (
                     remaining
                     if remaining < maker.order.quantity
@@ -361,7 +373,7 @@ cdef class MatchingEngine:
                 )
 
                 self._trades.append({
-                    "buy_order_id": maker.order.order_id,
+                    "buy_order_id": maker_order_id,
                     "sell_order_id": order_id,
                     "price": maker.order.price,
                     "quantity": trade_quantity,
@@ -374,6 +386,7 @@ cdef class MatchingEngine:
                 remaining -= trade_quantity
 
                 if maker.order.quantity == 0:
+                    self._active_orders.pop(maker_order_id, None)
                     queue.pop_head()
 
                 if queue.is_empty():
@@ -389,16 +402,15 @@ cdef class MatchingEngine:
             if side == "B":
                 if price not in self._buys:
                     self._buys[price] = PriceLevelQueue()
-
                 queue = <PriceLevelQueue>self._buys[price]
                 queue.add_order(incoming)
-
             else:
                 if price not in self._sells:
                     self._sells[price] = PriceLevelQueue()
-
                 queue = <PriceLevelQueue>self._sells[price]
                 queue.add_order(incoming)
+
+            self._active_orders[order_id] = (side, price)
 
         filled = original_quantity - remaining
 
@@ -442,9 +454,7 @@ cdef class MatchingEngine:
             max_orders = 0xFFFFFFFF
 
         while processed < max_orders:
-
             with ring_buffer._locked():
-
                 state = ring_buffer._get_state()
 
                 (
@@ -497,7 +507,6 @@ cdef class MatchingEngine:
                 )
 
                 ring_buffer.mm.flush()
-
                 processed += 1
 
         return processed

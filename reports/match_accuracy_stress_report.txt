@@ -1,12 +1,13 @@
 CHRONOSENGINE MATCH ACCURACY STRESS REPORT
 ================================================
-Generated at (UTC): 2026-11-01T06:25:17.651609+00:00
+Generated at (UTC): 2026-11-02T05:21:26.821085+00:00
 
 WORKLOAD
 Sell orders: 5,000
 Buy orders: 5,000
 Total orders per run: 10,000
-Validation runs: 2
+Warm-up runs: 2
+Measured runs: 10
 
 MATCHING ACCURACY
 Expected trades: 8,134
@@ -19,10 +20,23 @@ Unexpected trades: 0
 Deterministic repeated runs: PASS
 
 EXECUTION PERFORMANCE
-Run 1: 0.010358 seconds, 965,437 orders/second
-Run 2: 0.010606 seconds, 942,836 orders/second
-Average execution time: 0.010482 seconds
-Average throughput: 954,003 orders/second
+Run 1: 0.013180 seconds, 758,708 orders/second
+Run 2: 0.010072 seconds, 992,812 orders/second
+Run 3: 0.011492 seconds, 870,148 orders/second
+Run 4: 0.012421 seconds, 805,095 orders/second
+Run 5: 0.013094 seconds, 763,685 orders/second
+Run 6: 0.014022 seconds, 713,190 orders/second
+Run 7: 0.011921 seconds, 838,863 orders/second
+Run 8: 0.015032 seconds, 665,256 orders/second
+Run 9: 0.016857 seconds, 593,218 orders/second
+Run 10: 0.014879 seconds, 672,106 orders/second
+
+Average execution time: 0.013297 seconds
+Average throughput: 752,048 orders/second
+Median execution time: 0.013137 seconds
+Median throughput: 761,189 orders/second
+Minimum throughput: 593,218 orders/second
+Maximum throughput: 992,812 orders/second
 
 FINAL RESULT: PASS
 All actual trades and remaining orders matched the independent reference model.
