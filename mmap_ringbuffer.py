@@ -1,4 +1,5 @@
 
+import atexit
 import mmap
 import os
 import struct
@@ -12,7 +13,6 @@ class MMapRingBuffer:
     """Memory-mapped ring buffer with process-shared synchronization."""
 
     # write_index, item_count, read_index, unread_count, sequence_number
-    # Sequence number uses 64 bits.
     HEADER = struct.Struct("<IIIIQ")
 
     def __init__(self, filename, capacity=100):
@@ -26,23 +26,25 @@ class MMapRingBuffer:
         self.header_size = self.HEADER.size
         self.file_size = self.header_size + capacity * self.record_size
 
-        # Ensure the parent directory exists.
-        parent = os.path.dirname(os.path.abspath(filename))
-        os.makedirs(parent, exist_ok=True)
-
-        # Create/open the shared lock file.
-        self.lock_file = open(self.lock_filename, "a+b")
-        self.lock_file.seek(0, os.SEEK_END)
-
-        if self.lock_file.tell() == 0:
-            self.lock_file.write(b"\0")
-            self.lock_file.flush()
-
         self.file = None
         self.mm = None
+        self.lock_file = None
+        self._closed = False
 
         try:
-            # Lock before checking or initializing the shared data file.
+            # Ensure parent directory exists.
+            parent = os.path.dirname(os.path.abspath(filename))
+            os.makedirs(parent, exist_ok=True)
+
+            # Create/open shared lock file.
+            self.lock_file = open(self.lock_filename, "a+b")
+            self.lock_file.seek(0, os.SEEK_END)
+
+            if self.lock_file.tell() == 0:
+                self.lock_file.write(b"\0")
+                self.lock_file.flush()
+
+            # Initialize or open the shared data file.
             with self._locked():
                 if (
                     not os.path.exists(self.filename)
@@ -80,18 +82,32 @@ class MMapRingBuffer:
         except Exception:
             if self.mm is not None:
                 self.mm.close()
+                self.mm = None
+
             if self.file is not None:
                 self.file.close()
-            self.lock_file.close()
+                self.file = None
+
+            if self.lock_file is not None:
+                self.lock_file.close()
+                self.lock_file = None
+
             raise
+
+        # Register cleanup only after successful initialization.
+        atexit.register(self.close)
 
     @contextmanager
     def _locked(self):
         """Acquire a one-byte lock shared by processes on Windows."""
+        if self._closed or self.lock_file is None:
+            raise RuntimeError("Ring buffer is closed")
+
         self.lock_file.seek(0)
         msvcrt.locking(
             self.lock_file.fileno(), msvcrt.LK_LOCK, 1
         )
+
         try:
             yield
         finally:
@@ -245,38 +261,63 @@ class MMapRingBuffer:
             return orders
 
     def close(self):
+        """Flush and release all ring-buffer resources safely."""
+
+        if self._closed:
+            return
+
+        # Do not close resources while another thread holds the lock.
+        # The OS releases the process-level file lock when the handle closes.
+        error = None
+
         if self.mm is not None:
-            self.mm.close()
-            self.mm = None
+            try:
+                self.mm.flush()
+            except Exception as exc:
+                error = exc
+
+            try:
+                self.mm.close()
+                self.mm = None
+            except Exception as exc:
+                if error is None:
+                    error = exc
+
+                # Keep resources available for a later cleanup attempt.
+                raise error
 
         if self.file is not None:
-            self.file.close()
-            self.file = None
+            try:
+                self.file.close()
+                self.file = None
+            except Exception as exc:
+                if error is None:
+                    error = exc
 
         if self.lock_file is not None:
-            self.lock_file.close()
-            self.lock_file = None
+            try:
+                self.lock_file.close()
+                self.lock_file = None
+            except Exception as exc:
+                if error is None:
+                    error = exc
 
+        if (
+            self.mm is None
+            and self.file is None
+            and self.lock_file is None
+        ):
+            self._closed = True
+            atexit.unregister(self.close)
 
-if __name__ == "__main__":
-    buffer = MMapRingBuffer("orders_buffer.dat", capacity=3)
+        if error is not None:
+            raise error
 
-    try:
-        for order_id in range(1001, 1005):
-            buffer.push({
-                "order_id": order_id,
-                "side": "B" if order_id % 2 else "S",
-                "price": 125.50 + order_id - 1001,
-                "quantity": 10,
-                "timestamp": 1720000000000 + order_id,
-            })
+    def __enter__(self):
+        if self._closed:
+            raise RuntimeError("Ring buffer is already closed")
+        return self
 
-        print("Stored orders:", buffer.read_all())
-        print("Sequence number:", buffer.sequence_number)
-        print("Unread count:", buffer.unread_count)
-        print("Consume one order:", buffer.read_next())
-        print("Read cursor:", buffer.read_index)
-        print("Remaining unread:", buffer.unread_count)
-
-    finally:
-        buffer.close()
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False

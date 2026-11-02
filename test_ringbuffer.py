@@ -20,8 +20,12 @@ class TestRingBufferBoundaryAndWraparound(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.filename = os.path.join(self.temp_dir.name, "ringbuffer.dat")
-        self.buffer = MMapRingBuffer(self.filename, capacity=3)
+        self.filename = os.path.join(
+            self.temp_dir.name, "ringbuffer.dat"
+        )
+        self.buffer = MMapRingBuffer(
+            self.filename, capacity=3
+        )
 
     def tearDown(self):
         self.buffer.close()
@@ -83,6 +87,36 @@ class TestRingBufferBoundaryAndWraparound(unittest.TestCase):
     def test_zero_capacity_is_rejected(self):
         with self.assertRaises(ValueError):
             MMapRingBuffer(self.filename, capacity=0)
+
+    def test_close_is_idempotent(self):
+        self.buffer.close()
+        self.buffer.close()
+
+        self.assertIsNone(self.buffer.mm)
+        self.assertIsNone(self.buffer.file)
+        self.assertIsNone(self.buffer.lock_file)
+
+    def test_context_manager_closes_resources(self):
+        filename = os.path.join(
+            self.temp_dir.name, "context_buffer.dat"
+        )
+
+        with MMapRingBuffer(filename, capacity=3) as buffer:
+            buffer.push(make_order(10))
+            self.assertEqual(
+                buffer.read_all()[0]["order_id"], 10
+            )
+
+        self.assertIsNone(buffer.mm)
+        self.assertIsNone(buffer.file)
+        self.assertIsNone(buffer.lock_file)
+
+    def test_close_preserves_buffer_file(self):
+        self.buffer.push(make_order(20))
+        self.buffer.close()
+
+        self.assertTrue(os.path.exists(self.filename))
+        self.assertGreater(os.path.getsize(self.filename), 0)
 
 
 if __name__ == "__main__":
