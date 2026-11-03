@@ -1,6 +1,6 @@
-
 from libc.stdlib cimport malloc, free
 from .matching_engine cimport Order, OrderNode
+from .latency_metrics import RollingLatencyPercentiles
 from math import isfinite
 from time import perf_counter_ns
 
@@ -162,7 +162,7 @@ cdef class PriceLevelQueue:
 
 
 cdef class MatchingEngine:
-    """Limit-order matching engine with nanosecond latency metrics."""
+    """Limit-order matching engine with rolling nanosecond latency metrics."""
 
     cdef dict _buys
     cdef dict _sells
@@ -179,7 +179,9 @@ cdef class MatchingEngine:
     cdef unsigned long long _successful_orders
     cdef unsigned long long _failed_orders
 
-    def __cinit__(self):
+    cdef object _rolling_latency
+
+    def __cinit__(self, latency_window_size=10000):
         self._buys = {}
         self._sells = {}
         self._trades = []
@@ -195,6 +197,10 @@ cdef class MatchingEngine:
         self._successful_orders = 0
         self._failed_orders = 0
 
+        self._rolling_latency = RollingLatencyPercentiles(
+            latency_window_size
+        )
+
     cdef void _start_timing(self):
         self._last_ingress_ns = perf_counter_ns()
 
@@ -207,6 +213,9 @@ cdef class MatchingEngine:
         self._last_latency_ns = latency
         self._total_latency_ns += latency
         self._measured_orders += 1
+
+        # Record successful and failed operation latencies.
+        self._rolling_latency.add_sample(int(latency))
 
         if successful:
             self._successful_orders += 1
@@ -485,9 +494,10 @@ cdef class MatchingEngine:
         return list(self._trades)
 
     def get_latency_metrics(self):
-        """Return engine processing latency measurements in nanoseconds."""
+        """Return engine processing latency and rolling percentiles."""
 
         cdef double average_latency
+        cdef dict percentile_metrics
 
         if self._measured_orders:
             average_latency = (
@@ -496,6 +506,8 @@ cdef class MatchingEngine:
         else:
             average_latency = 0.0
 
+        percentile_metrics = self._rolling_latency.get_percentiles()
+
         return {
             "last_ingress_ns": self._last_ingress_ns,
             "last_egress_ns": self._last_egress_ns,
@@ -503,6 +515,15 @@ cdef class MatchingEngine:
             "average_latency_ns": average_latency,
             "min_latency_ns": self._min_latency_ns,
             "max_latency_ns": self._max_latency_ns,
+
+            "p50_latency_ns": percentile_metrics["p50_latency_ns"],
+            "p90_latency_ns": percentile_metrics["p90_latency_ns"],
+            "p99_latency_ns": percentile_metrics["p99_latency_ns"],
+            "p999_latency_ns": percentile_metrics["p999_latency_ns"],
+
+            "latency_window_size": percentile_metrics["latency_window_size"],
+            "latency_sample_count": percentile_metrics["latency_sample_count"],
+
             "measured_orders": self._measured_orders,
             "successful_orders": self._successful_orders,
             "failed_orders": self._failed_orders,
