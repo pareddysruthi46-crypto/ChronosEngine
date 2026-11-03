@@ -3,7 +3,7 @@ import struct
 
 # Binary layout:
 # Order ID | Side | Price | Quantity | Timestamp
-ORDER_STRUCT = struct.Struct("<QcdIQ")
+ORDER_STRUCT = struct.Struct("<Qc7xdI4xQ")
 
 
 def pack_order(order_id, side, price, quantity, timestamp):
