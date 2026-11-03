@@ -1,4 +1,5 @@
 from libc.stdlib cimport malloc, free
+from libc.stddef cimport size_t
 from libc.string cimport memcpy
 from libc.stdint cimport uint64_t, uint32_t
 from .matching_engine cimport Order, OrderNode
@@ -20,15 +21,98 @@ cdef unsigned int _apply_fill(
     return trade_quantity
 
 
+cdef class OrderNodePool:
+    """Fixed-capacity pool of reusable C order nodes."""
+
+    cdef OrderNode* _nodes
+    cdef OrderNode* _free_head
+    cdef Py_ssize_t _capacity
+    cdef Py_ssize_t _available
+
+    def __cinit__(self, Py_ssize_t capacity=100000):
+        cdef Py_ssize_t i
+        cdef OrderNode* node
+
+        self._nodes = NULL
+        self._free_head = NULL
+        self._capacity = 0
+        self._available = 0
+
+        if capacity <= 0:
+            raise ValueError("Pool capacity must be positive")
+
+        # Prevent the allocation-size calculation from overflowing size_t.
+        if <size_t>capacity > (<size_t>-1) // sizeof(OrderNode):
+            raise OverflowError("Order node pool capacity is too large")
+
+        self._nodes = <OrderNode*>malloc(
+            <size_t>capacity * sizeof(OrderNode)
+        )
+        if self._nodes == NULL:
+            raise MemoryError("Unable to allocate order node pool")
+
+        self._capacity = capacity
+        self._available = capacity
+
+        # Link all pre-allocated nodes into the free list.
+        for i in range(capacity):
+            node = &self._nodes[i]
+            node.prev = NULL
+            node.next = self._free_head
+            self._free_head = node
+
+    def __dealloc__(self):
+        if self._nodes != NULL:
+            free(self._nodes)
+            self._nodes = NULL
+            self._free_head = NULL
+
+    cdef OrderNode* acquire(self) except NULL:
+        cdef OrderNode* node
+
+        if self._free_head == NULL:
+            raise MemoryError("Order node pool exhausted")
+
+        node = self._free_head
+        self._free_head = node.next
+
+        node.prev = NULL
+        node.next = NULL
+        self._available -= 1
+
+        return node
+
+    cdef void release(self, OrderNode* node) noexcept:
+        if node == NULL:
+            return
+
+        # Return the node to the pool's free list.
+        node.prev = NULL
+        node.next = self._free_head
+        self._free_head = node
+        self._available += 1
+
+    def get_stats(self):
+        return {
+            "capacity": self._capacity,
+            "available": self._available,
+            "in_use": self._capacity - self._available,
+        }
+
+
 cdef class OrderBookNode:
+    """Standalone order node backed by a one-node memory pool."""
+
     cdef OrderNode* node
+    cdef OrderNodePool _pool
 
     def __cinit__(self):
         self.node = NULL
+        self._pool = OrderNodePool(1)
 
     def __dealloc__(self):
         if self.node != NULL:
-            free(self.node)
+            self._pool.release(self.node)
             self.node = NULL
 
     def set_order(
@@ -40,9 +124,7 @@ cdef class OrderBookNode:
         unsigned long long timestamp,
     ):
         if self.node == NULL:
-            self.node = <OrderNode*>malloc(sizeof(OrderNode))
-            if self.node == NULL:
-                raise MemoryError()
+            self.node = self._pool.acquire()
 
         self.node.order.order_id = order_id
         self.node.order.side = side
@@ -66,14 +148,16 @@ cdef class OrderBookNode:
 
 
 cdef class PriceLevelQueue:
-    """Doubly-linked queue for orders at one price level."""
+    """Doubly-linked queue using nodes from a shared memory pool."""
 
     cdef OrderNode* head
     cdef OrderNode* tail
+    cdef OrderNodePool _pool
 
-    def __cinit__(self):
+    def __cinit__(self, OrderNodePool pool):
         self.head = NULL
         self.tail = NULL
+        self._pool = pool
 
     def __dealloc__(self):
         cdef OrderNode* current
@@ -83,7 +167,7 @@ cdef class PriceLevelQueue:
 
         while current != NULL:
             following = current.next
-            free(current)
+            self._pool.release(current)
             current = following
 
         self.head = NULL
@@ -93,15 +177,15 @@ cdef class PriceLevelQueue:
         cdef OrderNode* node
         cdef OrderNode* current
 
-        node = <OrderNode*>malloc(sizeof(OrderNode))
-        if node == NULL:
-            raise MemoryError()
+        # Acquire before changing queue links. If the pool is exhausted,
+        # the existing queue remains unchanged.
+        node = self._pool.acquire()
 
         node.order = order
         node.prev = NULL
         node.next = NULL
 
-        # Preserve timestamp priority; equal timestamps keep insertion order.
+        # Preserve timestamp priority. Equal timestamps retain insertion order.
         current = self.tail
 
         while (
@@ -145,7 +229,7 @@ cdef class PriceLevelQueue:
         else:
             self.tail = NULL
 
-        free(old_head)
+        self._pool.release(old_head)
 
     cdef bint remove_order(self, unsigned long long order_id):
         """Remove a specific active order from this price level."""
@@ -165,7 +249,7 @@ cdef class PriceLevelQueue:
                 else:
                     self.tail = current.prev
 
-                free(current)
+                self._pool.release(current)
                 return True
 
             current = current.next
@@ -177,21 +261,23 @@ cdef class PriceLevelQueue:
 
 
 cdef class MatchingEngine:
-    """Limit-order matching engine using price-time priority."""
+    """Limit-order matching engine using price-time priority and a node pool."""
 
     cdef dict _buys
     cdef dict _sells
     cdef list _trades
     cdef set _seen_order_ids
     cdef dict _active_orders
+    cdef OrderNodePool _node_pool
 
-    def __cinit__(self):
+    def __cinit__(self, Py_ssize_t node_pool_size=100000):
         self._buys = {}
         self._sells = {}
         self._trades = []
         self._seen_order_ids = set()
         # order_id -> (side, price); deliberately stores no raw C pointers.
         self._active_orders = {}
+        self._node_pool = OrderNodePool(node_pool_size)
 
     def insert_order(
         self,
@@ -204,6 +290,7 @@ cdef class MatchingEngine:
         """Insert an order directly into the active book without matching."""
         cdef Order incoming
         cdef PriceLevelQueue queue
+        cdef dict levels
 
         if side not in ("B", "S"):
             raise ValueError("side must be 'B' (buy) or 'S' (sell)")
@@ -223,16 +310,16 @@ cdef class MatchingEngine:
         incoming.quantity = quantity
         incoming.timestamp = timestamp
 
-        if side == "B":
-            if price not in self._buys:
-                self._buys[price] = PriceLevelQueue()
-            queue = <PriceLevelQueue>self._buys[price]
-        else:
-            if price not in self._sells:
-                self._sells[price] = PriceLevelQueue()
-            queue = <PriceLevelQueue>self._sells[price]
+        levels = self._buys if side == "B" else self._sells
 
-        queue.add_order(incoming)
+        if price in levels:
+            queue = <PriceLevelQueue>levels[price]
+            queue.add_order(incoming)
+        else:
+            # Add to the dictionary only after node acquisition succeeds.
+            queue = PriceLevelQueue(self._node_pool)
+            queue.add_order(incoming)
+            levels[price] = queue
 
         self._active_orders[order_id] = (side, price)
         self._seen_order_ids.add(order_id)
@@ -289,6 +376,7 @@ cdef class MatchingEngine:
         cdef PriceLevelQueue queue
         cdef double best_price
         cdef unsigned long long maker_order_id
+        cdef dict levels
 
         if side not in ("B", "S"):
             raise ValueError("side must be 'B' (buy) or 'S' (sell)")
@@ -305,8 +393,6 @@ cdef class MatchingEngine:
         side_code = 66 if side == "B" else 83
         original_quantity = quantity
         remaining = quantity
-
-        self._seen_order_ids.add(order_id)
 
         if side == "B":
             # Match the lowest-priced sell orders first.
@@ -399,18 +485,20 @@ cdef class MatchingEngine:
             incoming.quantity = remaining
             incoming.timestamp = timestamp
 
-            if side == "B":
-                if price not in self._buys:
-                    self._buys[price] = PriceLevelQueue()
-                queue = <PriceLevelQueue>self._buys[price]
+            levels = self._buys if side == "B" else self._sells
+
+            if price in levels:
+                queue = <PriceLevelQueue>levels[price]
                 queue.add_order(incoming)
             else:
-                if price not in self._sells:
-                    self._sells[price] = PriceLevelQueue()
-                queue = <PriceLevelQueue>self._sells[price]
+                # Avoid leaving an empty price level if the pool is exhausted.
+                queue = PriceLevelQueue(self._node_pool)
                 queue.add_order(incoming)
+                levels[price] = queue
 
             self._active_orders[order_id] = (side, price)
+
+        self._seen_order_ids.add(order_id)
 
         filled = original_quantity - remaining
 
@@ -541,3 +629,7 @@ cdef class MatchingEngine:
 
     def get_trades(self):
         return list(self._trades)
+
+    def get_memory_pool_stats(self):
+        """Return memory-pool capacity and current node usage."""
+        return self._node_pool.get_stats()
