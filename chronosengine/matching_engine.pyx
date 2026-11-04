@@ -1,4 +1,4 @@
-from libc.stdlib cimport malloc, free
+﻿from libc.stdlib cimport malloc, free
 from .matching_engine cimport Order, OrderNode
 from .latency_metrics import RollingLatencyPercentiles
 from math import isfinite
@@ -523,6 +523,7 @@ cdef class MatchingEngine:
 
             "latency_window_size": percentile_metrics["latency_window_size"],
             "latency_sample_count": percentile_metrics["latency_sample_count"],
+            "latency_samples_ns": self._rolling_latency.get_samples(),
 
             "measured_orders": self._measured_orders,
             "successful_orders": self._successful_orders,

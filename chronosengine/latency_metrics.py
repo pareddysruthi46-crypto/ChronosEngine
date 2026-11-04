@@ -45,6 +45,10 @@ class RollingLatencyPercentiles:
     def sample_count(self):
         return len(self._samples)
 
+    def get_samples(self):
+        """Return a snapshot of the recent latency samples."""
+        return tuple(self._samples)
+
     def get_percentiles(self):
         return {
             "p50_latency_ns": self.percentile(0.50),

@@ -19,6 +19,21 @@ class TestRollingLatencyPercentiles(unittest.TestCase):
         self.assertEqual(result["p99_latency_ns"], 99)
         self.assertEqual(result["p999_latency_ns"], 100)
 
+    def test_get_samples_returns_snapshot(self):
+        metrics = RollingLatencyPercentiles(window_size=3)
+
+        for value in [10, 20, 30]:
+            metrics.add_sample(value)
+
+        samples = metrics.get_samples()
+
+        self.assertEqual(samples, (10, 20, 30))
+
+        metrics.add_sample(40)
+
+        self.assertEqual(samples, (10, 20, 30))
+        self.assertEqual(metrics.get_samples(), (20, 30, 40))
+
     def test_rolling_window(self):
         metrics = RollingLatencyPercentiles(window_size=3)
 

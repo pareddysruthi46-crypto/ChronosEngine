@@ -1,4 +1,4 @@
-
+﻿
 import argparse
 import curses
 import time
@@ -66,7 +66,102 @@ def get_observed_order_ids(order_book, trades):
     return order_ids
 
 
-def draw_layout(stdscr, order_book=None, ops=0, depth_levels=DEPTH_LEVELS):
+def build_latency_histogram(samples_ns, bucket_count=5, bar_width=24):
+    """Build an ASCII histogram from actual latency samples."""
+
+    if bucket_count <= 0 or bar_width <= 0:
+        raise ValueError("bucket_count and bar_width must be positive")
+
+    samples = list(samples_ns)
+
+    if not samples:
+        return []
+
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        for value in samples
+    ):
+        raise ValueError("Latency samples must be non-negative integers")
+
+    max_latency = max(samples)
+    bucket_width = max(
+        1,
+        (max_latency + 1 + bucket_count - 1) // bucket_count,
+    )
+
+    counts = [0] * bucket_count
+
+    for latency in samples:
+        index = min(latency // bucket_width, bucket_count - 1)
+        counts[index] += 1
+
+    max_count = max(counts)
+    histogram = []
+
+    for index, count in enumerate(counts):
+        lower = index * bucket_width
+        upper = (index + 1) * bucket_width
+
+        bar_length = round(count / max_count * bar_width)
+
+        label = (
+            f"{lower / 1000:.2f}-{upper / 1000:.2f} us"
+        )
+
+        histogram.append({
+            "label": label,
+            "count": count,
+            "bar": "#" * bar_length,
+        })
+
+    return histogram
+
+
+def draw_latency_panel(stdscr, metrics, start_y):
+    """Render latency histogram and percentile statistics."""
+
+    samples = metrics.get("latency_samples_ns", [])
+    histogram = build_latency_histogram(samples)
+
+    safe_addstr(
+        stdscr, start_y, 2,
+        "LATENCY DISTRIBUTION (ASCII HISTOGRAM)",
+    )
+
+    if not histogram:
+        safe_addstr(stdscr, start_y + 1, 2, "Waiting for latency samples...")
+        return
+
+    for index, bucket in enumerate(histogram):
+        line = (
+            f"{bucket['label']:>17} | "
+            f"{bucket['bar']:<24} {bucket['count']}"
+        )
+        safe_addstr(stdscr, start_y + 1 + index, 2, line)
+
+    p50 = metrics.get("p50_latency_ns", 0) / 1000
+    p90 = metrics.get("p90_latency_ns", 0) / 1000
+    p99 = metrics.get("p99_latency_ns", 0) / 1000
+    p999 = metrics.get("p999_latency_ns", 0) / 1000
+
+    safe_addstr(
+        stdscr, start_y + 6, 2,
+        f"P50: {p50:.2f}  P90: {p90:.2f}  "
+        f"P99: {p99:.2f}  P999: {p999:.2f} us",
+    )
+
+    safe_addstr(
+        stdscr, start_y + 7, 2,
+        f"Samples: {metrics.get('latency_sample_count', len(samples))}",
+    )
+
+
+def draw_layout(
+    stdscr, order_book=None, ops=0,
+    depth_levels=DEPTH_LEVELS, latency_metrics=None
+):
     try:
         curses.curs_set(0)
     except curses.error:
@@ -122,7 +217,7 @@ def draw_layout(stdscr, order_book=None, ops=0, depth_levels=DEPTH_LEVELS):
         )
         safe_addstr(stdscr, 8, 2, "-" * min(width - 4, 60))
 
-        visible_levels = min(depth_levels, max(0, height - 10))
+        visible_levels = min(depth_levels, max(0, height - 20)) if height >= 24 and width >= 64 else min(depth_levels, max(0, height - 10))
 
         if not bids and not asks:
             safe_addstr(stdscr, 9, 2, "Order book is empty.")
@@ -145,6 +240,10 @@ def draw_layout(stdscr, order_book=None, ops=0, depth_levels=DEPTH_LEVELS):
             stdscr, 2, 0,
             "Enlarge terminal to at least 64 columns and 12 rows.",
         )
+
+    # Keep the histogram separate from the order book on usable terminal sizes.
+    if latency_metrics is not None and height >= 24 and width >= 64:
+        draw_latency_panel(stdscr, latency_metrics, height - 10)
 
     if height > 1:
         safe_addstr(stdscr, height - 1, 0, "Press Q to quit")
@@ -184,7 +283,15 @@ def main(stdscr, engine=None, options=None):
 
         ops = int(len(recent_order_times) / options.ops_window)
 
-        draw_layout(stdscr, order_book, ops, options.depth_levels)
+        latency_metrics = engine.get_latency_metrics()
+
+        draw_layout(
+            stdscr,
+            order_book,
+            ops,
+            options.depth_levels,
+            latency_metrics,
+        )
 
         key = stdscr.getch()
         if key in (ord("q"), ord("Q")):
