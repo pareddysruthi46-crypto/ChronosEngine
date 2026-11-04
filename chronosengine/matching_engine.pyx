@@ -269,6 +269,7 @@ cdef class MatchingEngine:
     cdef set _seen_order_ids
     cdef dict _active_orders
     cdef OrderNodePool _node_pool
+    cdef object _outbound_ring_buffer
 
     def __cinit__(self, Py_ssize_t node_pool_size=100000):
         self._buys = {}
@@ -278,6 +279,16 @@ cdef class MatchingEngine:
         # order_id -> (side, price); deliberately stores no raw C pointers.
         self._active_orders = {}
         self._node_pool = OrderNodePool(node_pool_size)
+        self._outbound_ring_buffer = None
+
+    def set_output_ring_buffer(self, ring_buffer):
+        """Attach or detach the outbound matched-trade ring buffer."""
+        if ring_buffer is not None:
+            if getattr(ring_buffer, "record_size", None) != 44:
+                raise ValueError("Unexpected outbound trade record size")
+
+        self._outbound_ring_buffer = ring_buffer
+        return True
 
     def insert_order(
         self,
@@ -416,13 +427,22 @@ cdef class MatchingEngine:
                     else maker.order.quantity
                 )
 
-                self._trades.append({
-                    "buy_order_id": order_id,
-                    "sell_order_id": maker_order_id,
-                    "price": maker.order.price,
-                    "quantity": trade_quantity,
-                    "timestamp": timestamp,
-                })
+                if self._outbound_ring_buffer is None:
+                    self._trades.append({
+                        "buy_order_id": order_id,
+                        "sell_order_id": maker_order_id,
+                        "price": maker.order.price,
+                        "quantity": trade_quantity,
+                        "timestamp": timestamp,
+                    })
+                else:
+                    self._outbound_ring_buffer.push_trade_values(
+                        order_id,
+                        maker_order_id,
+                        maker.order.price,
+                        trade_quantity,
+                        timestamp,
+                    )
 
                 with nogil:
                     trade_quantity = _apply_fill(maker, remaining)
@@ -458,13 +478,22 @@ cdef class MatchingEngine:
                     else maker.order.quantity
                 )
 
-                self._trades.append({
-                    "buy_order_id": maker_order_id,
-                    "sell_order_id": order_id,
-                    "price": maker.order.price,
-                    "quantity": trade_quantity,
-                    "timestamp": timestamp,
-                })
+                if self._outbound_ring_buffer is None:
+                    self._trades.append({
+                        "buy_order_id": maker_order_id,
+                        "sell_order_id": order_id,
+                        "price": maker.order.price,
+                        "quantity": trade_quantity,
+                        "timestamp": timestamp,
+                    })
+                else:
+                    self._outbound_ring_buffer.push_trade_values(
+                        maker_order_id,
+                        order_id,
+                        maker.order.price,
+                        trade_quantity,
+                        timestamp,
+                    )
 
                 with nogil:
                     trade_quantity = _apply_fill(maker, remaining)
