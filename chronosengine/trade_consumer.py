@@ -3,8 +3,14 @@ import multiprocessing as mp
 import queue
 import time
 
+from chronosengine.trade_ledger import (
+    initialize_database,
+    insert_trades_batch,
+)
+
 
 STOP = None
+MAX_BATCH_RETRIES = 5
 
 REQUIRED_TRADE_FIELDS = {
     "buy_order_id",
@@ -25,56 +31,83 @@ def _validate_trade(trade):
             f"Trade is missing fields: {sorted(missing)}"
         )
 
-    # Ensure the trade can be serialized before it enters the queue.
     json.dumps(trade)
 
 
-def _trade_worker(trade_queue, output_file, batch_size):
-    """Background process: consume trades and append JSONL records."""
-    with open(output_file, "a", encoding="utf-8") as file:
-        running = True
+def _persist_batch(database_path, batch):
+    """Retry a failed SQLite batch a limited number of times."""
+    for attempt in range(MAX_BATCH_RETRIES):
+        try:
+            insert_trades_batch(database_path, batch)
+            return
+        except Exception:
+            if attempt == MAX_BATCH_RETRIES - 1:
+                raise
 
-        while running:
+            time.sleep(0.5 * (attempt + 1))
+
+
+def _trade_worker(trade_queue, database_path, batch_size):
+    """Persist queued trades asynchronously in SQLite batches."""
+    initialize_database(database_path)
+    stopping = False
+
+    while not stopping:
+        try:
+            item = trade_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+
+        if item is STOP:
+            break
+
+        batch = [item]
+
+        while len(batch) < batch_size:
             try:
-                item = trade_queue.get(timeout=0.2)
+                item = trade_queue.get_nowait()
             except queue.Empty:
-                continue
-
-            if item is STOP:
                 break
 
-            batch = [item]
+            if item is STOP:
+                stopping = True
+                break
 
-            while len(batch) < batch_size:
-                try:
-                    item = trade_queue.get_nowait()
-                except queue.Empty:
-                    break
+            batch.append(item)
 
-                if item is STOP:
-                    running = False
-                    break
+        _persist_batch(database_path, batch)
 
+    # Flush remaining queued trades before worker shutdown.
+    while True:
+        batch = []
+
+        while len(batch) < batch_size:
+            try:
+                item = trade_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if item is not STOP:
                 batch.append(item)
 
-            for trade in batch:
-                file.write(json.dumps(trade) + "\n")
+        if not batch:
+            break
 
-            file.flush()
+        _persist_batch(database_path, batch)
 
 
 class MatchedTradeConsumer:
-    """Owns a background process that persists matched trades."""
+    """Background process for batched SQLite trade persistence."""
 
     def __init__(
         self,
-        output_file="matched_trades.jsonl",
+        database_path="trade_ledger.db",
         batch_size=100,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
 
-        self.output_file = output_file
+        self.database_path = database_path
         self.batch_size = batch_size
         self.context = mp.get_context("spawn")
         self.trade_queue = self.context.Queue()
@@ -88,7 +121,7 @@ class MatchedTradeConsumer:
             target=_trade_worker,
             args=(
                 self.trade_queue,
-                self.output_file,
+                self.database_path,
                 self.batch_size,
             ),
             name="matched-trade-consumer",
@@ -115,15 +148,16 @@ class MatchedTradeConsumer:
             self.process.join(timeout)
 
             if self.process.is_alive():
-                self.process.terminate()
-                self.process.join()
+                raise TimeoutError(
+                    "Consumer did not finish flushing pending trades"
+                )
+
+        exit_code = self.process.exitcode
 
         self.trade_queue.close()
         self.trade_queue.join_thread()
 
-        exit_code = self.process.exitcode
         self.process = None
-        self.trade_queue = self.context.Queue()
 
         if exit_code != 0:
             raise RuntimeError(
@@ -132,12 +166,7 @@ class MatchedTradeConsumer:
 
 
 def publish_new_engine_trades(engine, consumer, last_trade_count=0):
-    """
-    Publish trades newly appended by MatchingEngine.get_trades().
-
-    Returns the updated trade count. If the engine's trade list shrinks,
-    its count is treated as having reset.
-    """
+    """Publish newly generated matching-engine trades."""
     trades = engine.get_trades()
 
     if len(trades) < last_trade_count:

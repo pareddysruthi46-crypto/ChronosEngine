@@ -1,5 +1,5 @@
-import json
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -8,6 +8,7 @@ from chronosengine.trade_consumer import (
     publish_new_engine_trades,
 )
 
+from chronosengine.trade_ledger import initialize_database
 from chronosengine.matching_engine import MatchingEngine
 
 
@@ -21,6 +22,38 @@ def make_trade(number):
     }
 
 
+def read_trades(database_path):
+    connection = sqlite3.connect(database_path)
+
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+                buy_order_id,
+                sell_order_id,
+                price,
+                quantity,
+                timestamp
+            FROM trades
+            ORDER BY trade_id
+            """
+        ).fetchall()
+
+        return [
+            {
+                "buy_order_id": row[0],
+                "sell_order_id": row[1],
+                "price": row[2],
+                "quantity": row[3],
+                "timestamp": row[4],
+            }
+            for row in rows
+        ]
+
+    finally:
+        connection.close()
+
+
 class FakeEngine:
     def __init__(self):
         self.trades = []
@@ -32,12 +65,14 @@ class FakeEngine:
 class TestMatchedTradeConsumer(unittest.TestCase):
 
     def test_background_worker_persists_trades(self):
-        """Check that the worker saves multiple trades."""
+        """Check that multiple trades are saved in SQLite batches."""
         with tempfile.TemporaryDirectory() as folder:
-            output = os.path.join(folder, "trades.jsonl")
+            database = os.path.join(folder, "trades.db")
+
+            initialize_database(database)
 
             consumer = MatchedTradeConsumer(
-                output_file=output,
+                database_path=database,
                 batch_size=2,
             )
 
@@ -53,11 +88,7 @@ class TestMatchedTradeConsumer(unittest.TestCase):
             finally:
                 consumer.stop()
 
-            with open(output, encoding="utf-8") as file:
-                saved = [
-                    json.loads(line)
-                    for line in file
-                ]
+            saved = read_trades(database)
 
             self.assertEqual(saved, trades)
             self.assertEqual(len(saved), 5)
@@ -65,11 +96,15 @@ class TestMatchedTradeConsumer(unittest.TestCase):
     def test_engine_trade_publishing_only_sends_new_trades(self):
         """Check that previously published trades are not duplicated."""
         with tempfile.TemporaryDirectory() as folder:
-            output = os.path.join(folder, "trades.jsonl")
+            database = os.path.join(folder, "trades.db")
+
+            initialize_database(database)
 
             engine = FakeEngine()
+
             consumer = MatchedTradeConsumer(
-                output_file=output
+                database_path=database,
+                batch_size=2,
             )
 
             engine.trades = [
@@ -97,11 +132,7 @@ class TestMatchedTradeConsumer(unittest.TestCase):
             finally:
                 consumer.stop()
 
-            with open(output, encoding="utf-8") as file:
-                saved = [
-                    json.loads(line)
-                    for line in file
-                ]
+            saved = read_trades(database)
 
             self.assertEqual(
                 saved,
@@ -117,10 +148,12 @@ class TestMatchedTradeConsumer(unittest.TestCase):
     def test_invalid_trade_is_rejected(self):
         """Check that incomplete trade records are rejected."""
         with tempfile.TemporaryDirectory() as folder:
-            output = os.path.join(folder, "trades.jsonl")
+            database = os.path.join(folder, "trades.db")
+
+            initialize_database(database)
 
             consumer = MatchedTradeConsumer(
-                output_file=output
+                database_path=database,
             )
 
             consumer.start()
@@ -135,23 +168,27 @@ class TestMatchedTradeConsumer(unittest.TestCase):
             finally:
                 consumer.stop()
 
+            self.assertEqual(read_trades(database), [])
+
     def test_invalid_batch_size_is_rejected(self):
         """Check that batch size must be positive."""
         with self.assertRaises(ValueError):
             MatchedTradeConsumer(batch_size=0)
 
     def test_actual_matching_engine_trades_are_persisted(self):
-        """Check integration with the real compiled matching engine."""
+        """Check integration with the compiled matching engine."""
         with tempfile.TemporaryDirectory() as folder:
-            output = os.path.join(
+            database = os.path.join(
                 folder,
-                "engine_trades.jsonl",
+                "engine_trades.db",
             )
+
+            initialize_database(database)
 
             engine = MatchingEngine()
 
             consumer = MatchedTradeConsumer(
-                output_file=output,
+                database_path=database,
                 batch_size=2,
             )
 
@@ -183,11 +220,7 @@ class TestMatchedTradeConsumer(unittest.TestCase):
             finally:
                 consumer.stop()
 
-            with open(output, encoding="utf-8") as file:
-                saved = [
-                    json.loads(line)
-                    for line in file
-                ]
+            saved = read_trades(database)
 
             self.assertEqual(
                 buy_result["filled_quantity"],
