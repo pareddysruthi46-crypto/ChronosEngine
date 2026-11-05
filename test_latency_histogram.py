@@ -1,6 +1,10 @@
-﻿import unittest
+﻿
+import unittest
 
-from chronosengine.ui.terminal_ui import build_latency_histogram
+from chronosengine.ui.terminal_ui import (
+    build_latency_histogram,
+    count_sla_breaches,
+)
 
 
 class TestLatencyHistogram(unittest.TestCase):
@@ -44,6 +48,55 @@ class TestLatencyHistogram(unittest.TestCase):
             sum(bucket["count"] for bucket in result),
             1,
         )
+
+
+class TestSLABreachCounter(unittest.TestCase):
+
+    def test_no_breaches_below_threshold(self):
+        samples = [10000, 20000, 30000]
+
+        self.assertEqual(
+            count_sla_breaches(samples),
+            0,
+        )
+
+    def test_exactly_50_microseconds_is_not_breach(self):
+        samples = [50000]
+
+        self.assertEqual(
+            count_sla_breaches(samples),
+            0,
+        )
+
+    def test_latency_above_threshold_is_breach(self):
+        samples = [50001, 75000, 100000]
+
+        self.assertEqual(
+            count_sla_breaches(samples),
+            3,
+        )
+
+    def test_mixed_latency_samples(self):
+        samples = [10000, 50000, 50001, 75000, 20000]
+
+        self.assertEqual(
+            count_sla_breaches(samples),
+            2,
+        )
+
+    def test_empty_samples(self):
+        self.assertEqual(
+            count_sla_breaches([]),
+            0,
+        )
+
+    def test_invalid_samples(self):
+        with self.assertRaises(ValueError):
+            count_sla_breaches([-100])
+
+    def test_invalid_threshold(self):
+        with self.assertRaises(ValueError):
+            count_sla_breaches([10000], -1)
 
 
 if __name__ == "__main__":

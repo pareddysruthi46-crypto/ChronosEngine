@@ -10,21 +10,30 @@ DEPTH_LEVELS = 5
 REFRESH_INTERVAL_MS = 250
 OPS_WINDOW_SECONDS = 1.0
 
+# 50 microseconds = 50,000 nanoseconds
+SLA_THRESHOLD_NS = 50_000
+
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(
         description="ChronosEngine terminal matching engine dashboard"
     )
     parser.add_argument(
-        "--refresh-ms", type=int, default=250,
+        "--refresh-ms",
+        type=int,
+        default=250,
         help="Dashboard refresh interval in milliseconds (default: 250)"
     )
     parser.add_argument(
-        "--depth-levels", type=int, default=5,
+        "--depth-levels",
+        type=int,
+        default=5,
         help="Number of order book levels to display (default: 5)"
     )
     parser.add_argument(
-        "--ops-window", type=float, default=1.0,
+        "--ops-window",
+        type=float,
+        default=1.0,
         help="OPS measurement window in seconds (default: 1.0)"
     )
 
@@ -40,12 +49,20 @@ def parse_args(args=None):
     return options
 
 
-def safe_addstr(stdscr, y, x, text):
+def safe_addstr(stdscr, y, x, text, attr=0):
     height, width = stdscr.getmaxyx()
+
     if y < 0 or y >= height or x < 0 or x >= width - 1:
         return
+
     try:
-        stdscr.addnstr(y, x, str(text), width - x - 1)
+        stdscr.addnstr(
+            y,
+            x,
+            str(text),
+            width - x - 1,
+            attr
+        )
     except curses.error:
         pass
 
@@ -66,11 +83,48 @@ def get_observed_order_ids(order_book, trades):
     return order_ids
 
 
+def count_sla_breaches(samples_ns, threshold_ns=SLA_THRESHOLD_NS):
+    """
+    Count latency samples exceeding the SLA threshold.
+
+    Default threshold: 50,000 ns (50 microseconds).
+    Exactly 50,000 ns is not considered a breach.
+    """
+
+    if (
+        isinstance(threshold_ns, bool)
+        or not isinstance(threshold_ns, int)
+        or threshold_ns < 0
+    ):
+        raise ValueError(
+            "threshold_ns must be a non-negative integer"
+        )
+
+    samples = list(samples_ns)
+
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        for value in samples
+    ):
+        raise ValueError(
+            "Latency samples must be non-negative integers"
+        )
+
+    return sum(
+        1 for latency in samples
+        if latency > threshold_ns
+    )
+
+
 def build_latency_histogram(samples_ns, bucket_count=5, bar_width=24):
     """Build an ASCII histogram from actual latency samples."""
 
     if bucket_count <= 0 or bar_width <= 0:
-        raise ValueError("bucket_count and bar_width must be positive")
+        raise ValueError(
+            "bucket_count and bar_width must be positive"
+        )
 
     samples = list(samples_ns)
 
@@ -83,9 +137,12 @@ def build_latency_histogram(samples_ns, bucket_count=5, bar_width=24):
         or value < 0
         for value in samples
     ):
-        raise ValueError("Latency samples must be non-negative integers")
+        raise ValueError(
+            "Latency samples must be non-negative integers"
+        )
 
     max_latency = max(samples)
+
     bucket_width = max(
         1,
         (max_latency + 1 + bucket_count - 1) // bucket_count,
@@ -94,7 +151,10 @@ def build_latency_histogram(samples_ns, bucket_count=5, bar_width=24):
     counts = [0] * bucket_count
 
     for latency in samples:
-        index = min(latency // bucket_width, bucket_count - 1)
+        index = min(
+            latency // bucket_width,
+            bucket_count - 1
+        )
         counts[index] += 1
 
     max_count = max(counts)
@@ -104,7 +164,9 @@ def build_latency_histogram(samples_ns, bucket_count=5, bar_width=24):
         lower = index * bucket_width
         upper = (index + 1) * bucket_width
 
-        bar_length = round(count / max_count * bar_width)
+        bar_length = round(
+            count / max_count * bar_width
+        )
 
         label = (
             f"{lower / 1000:.2f}-{upper / 1000:.2f} us"
@@ -119,19 +181,79 @@ def build_latency_histogram(samples_ns, bucket_count=5, bar_width=24):
     return histogram
 
 
+def draw_sla_indicator(stdscr, samples, start_y):
+    """Display rolling SLA breach count and visual warning."""
+
+    breach_count = count_sla_breaches(samples)
+
+    if breach_count > 0:
+        warning_text = (
+            f"!!! SLA BREACH: {breach_count} samples "
+            f"exceeded 50 us !!!"
+        )
+
+        warning_attr = curses.A_BOLD
+
+        try:
+            if curses.has_colors():
+                warning_attr = (
+                    curses.color_pair(1) | curses.A_BOLD
+                )
+        except curses.error:
+            pass
+
+        safe_addstr(
+            stdscr,
+            start_y,
+            2,
+            warning_text,
+            warning_attr
+        )
+
+    else:
+        safe_addstr(
+            stdscr,
+            start_y,
+            2,
+            "SLA STATUS: NORMAL - No breaches above 50 us",
+            curses.A_BOLD
+        )
+
+    safe_addstr(
+        stdscr,
+        start_y + 1,
+        2,
+        f"SLA THRESHOLD: 50.00 us | "
+        f"BREACH COUNT: {breach_count}",
+    )
+
+
 def draw_latency_panel(stdscr, metrics, start_y):
-    """Render latency histogram and percentile statistics."""
+    """Render latency histogram, percentiles and SLA indicator."""
 
     samples = metrics.get("latency_samples_ns", [])
     histogram = build_latency_histogram(samples)
 
     safe_addstr(
-        stdscr, start_y, 2,
+        stdscr,
+        start_y,
+        2,
         "LATENCY DISTRIBUTION (ASCII HISTOGRAM)",
     )
 
     if not histogram:
-        safe_addstr(stdscr, start_y + 1, 2, "Waiting for latency samples...")
+        safe_addstr(
+            stdscr,
+            start_y + 1,
+            2,
+            "Waiting for latency samples..."
+        )
+
+        draw_sla_indicator(
+            stdscr,
+            samples,
+            start_y + 2
+        )
         return
 
     for index, bucket in enumerate(histogram):
@@ -139,7 +261,13 @@ def draw_latency_panel(stdscr, metrics, start_y):
             f"{bucket['label']:>17} | "
             f"{bucket['bar']:<24} {bucket['count']}"
         )
-        safe_addstr(stdscr, start_y + 1 + index, 2, line)
+
+        safe_addstr(
+            stdscr,
+            start_y + 1 + index,
+            2,
+            line
+        )
 
     p50 = metrics.get("p50_latency_ns", 0) / 1000
     p90 = metrics.get("p90_latency_ns", 0) / 1000
@@ -147,20 +275,33 @@ def draw_latency_panel(stdscr, metrics, start_y):
     p999 = metrics.get("p999_latency_ns", 0) / 1000
 
     safe_addstr(
-        stdscr, start_y + 6, 2,
+        stdscr,
+        start_y + 6,
+        2,
         f"P50: {p50:.2f}  P90: {p90:.2f}  "
         f"P99: {p99:.2f}  P999: {p999:.2f} us",
     )
 
     safe_addstr(
-        stdscr, start_y + 7, 2,
+        stdscr,
+        start_y + 7,
+        2,
         f"Samples: {metrics.get('latency_sample_count', len(samples))}",
+    )
+
+    draw_sla_indicator(
+        stdscr,
+        samples,
+        start_y + 8
     )
 
 
 def draw_layout(
-    stdscr, order_book=None, ops=0,
-    depth_levels=DEPTH_LEVELS, latency_metrics=None
+    stdscr,
+    order_book=None,
+    ops=0,
+    depth_levels=DEPTH_LEVELS,
+    latency_metrics=None
 ):
     try:
         curses.curs_set(0)
@@ -168,19 +309,35 @@ def draw_layout(
         pass
 
     stdscr.erase()
+
     height, width = stdscr.getmaxyx()
 
-    safe_addstr(stdscr, 0, 0, " ChronosEngine - Matching Engine Dashboard ")
-    safe_addstr(stdscr, 1, 2, f"ORDERS/SEC (OPS): {ops}")
+    safe_addstr(
+        stdscr,
+        0,
+        0,
+        " ChronosEngine - Matching Engine Dashboard "
+    )
+
+    safe_addstr(
+        stdscr,
+        1,
+        2,
+        f"ORDERS/SEC (OPS): {ops}"
+    )
 
     if order_book is None:
-        order_book = {"buys": [], "sells": []}
+        order_book = {
+            "buys": [],
+            "sells": []
+        }
 
     bids = sorted(
         order_book.get("buys", []),
         key=lambda order: float(order["price"]),
         reverse=True,
     )
+
     asks = sorted(
         order_book.get("sells", []),
         key=lambda order: float(order["price"]),
@@ -190,63 +347,149 @@ def draw_layout(
     best_ask = asks[0] if asks else None
 
     if height >= 12 and width >= 64:
-        safe_addstr(stdscr, 2, 2, "TOP OF BOOK")
+        safe_addstr(
+            stdscr,
+            2,
+            2,
+            "TOP OF BOOK"
+        )
 
         bid_text = (
-            f"{best_bid['price']:.2f} (Qty: {best_bid['quantity']})"
+            f"{best_bid['price']:.2f} "
+            f"(Qty: {best_bid['quantity']})"
             if best_bid else "--"
         )
+
         ask_text = (
-            f"{best_ask['price']:.2f} (Qty: {best_ask['quantity']})"
+            f"{best_ask['price']:.2f} "
+            f"(Qty: {best_ask['quantity']})"
             if best_ask else "--"
         )
 
         safe_addstr(
-            stdscr, 3, 2,
+            stdscr,
+            3,
+            2,
             f"BEST BID: {bid_text}    |    BEST ASK: {ask_text}",
         )
+
         safe_addstr(
-            stdscr, 5, 2,
+            stdscr,
+            5,
+            2,
             f"ORDER BOOK DEPTH - TOP {depth_levels} LEVELS",
         )
-        safe_addstr(stdscr, 6, 2, "-" * min(width - 4, 60))
+
         safe_addstr(
-            stdscr, 7, 2,
+            stdscr,
+            6,
+            2,
+            "-" * min(width - 4, 60)
+        )
+
+        safe_addstr(
+            stdscr,
+            7,
+            2,
             f"{'BID PRICE':>12} {'BID QTY':>9}  |  "
             f"{'ASK PRICE':>12} {'ASK QTY':>9}",
         )
-        safe_addstr(stdscr, 8, 2, "-" * min(width - 4, 60))
 
-        visible_levels = min(depth_levels, max(0, height - 20)) if height >= 24 and width >= 64 else min(depth_levels, max(0, height - 10))
+        safe_addstr(
+            stdscr,
+            8,
+            2,
+            "-" * min(width - 4, 60)
+        )
+
+        if height >= 24:
+            visible_levels = min(
+                depth_levels,
+                max(0, height - 20)
+            )
+        else:
+            visible_levels = min(
+                depth_levels,
+                max(0, height - 10)
+            )
 
         if not bids and not asks:
-            safe_addstr(stdscr, 9, 2, "Order book is empty.")
+            safe_addstr(
+                stdscr,
+                9,
+                2,
+                "Order book is empty."
+            )
+
         else:
             for level in range(visible_levels):
-                bid = bids[level] if level < len(bids) else None
-                ask = asks[level] if level < len(asks) else None
+                bid = (
+                    bids[level]
+                    if level < len(bids)
+                    else None
+                )
 
-                bid_price = f"{bid['price']:>12.2f}" if bid else f"{'--':>12}"
-                bid_qty = f"{bid['quantity']:>9}" if bid else f"{'--':>9}"
-                ask_price = f"{ask['price']:>12.2f}" if ask else f"{'--':>12}"
-                ask_qty = f"{ask['quantity']:>9}" if ask else f"{'--':>9}"
+                ask = (
+                    asks[level]
+                    if level < len(asks)
+                    else None
+                )
+
+                bid_price = (
+                    f"{bid['price']:>12.2f}"
+                    if bid else f"{'--':>12}"
+                )
+
+                bid_qty = (
+                    f"{bid['quantity']:>9}"
+                    if bid else f"{'--':>9}"
+                )
+
+                ask_price = (
+                    f"{ask['price']:>12.2f}"
+                    if ask else f"{'--':>12}"
+                )
+
+                ask_qty = (
+                    f"{ask['quantity']:>9}"
+                    if ask else f"{'--':>9}"
+                )
 
                 safe_addstr(
-                    stdscr, 9 + level, 2,
-                    f"{bid_price} {bid_qty}  |  {ask_price} {ask_qty}",
+                    stdscr,
+                    9 + level,
+                    2,
+                    f"{bid_price} {bid_qty}  |  "
+                    f"{ask_price} {ask_qty}",
                 )
+
     else:
         safe_addstr(
-            stdscr, 2, 0,
+            stdscr,
+            2,
+            0,
             "Enlarge terminal to at least 64 columns and 12 rows.",
         )
 
-    # Keep the histogram separate from the order book on usable terminal sizes.
-    if latency_metrics is not None and height >= 24 and width >= 64:
-        draw_latency_panel(stdscr, latency_metrics, height - 10)
+    # Keep histogram and SLA panel separate from the order book.
+    if (
+        latency_metrics is not None
+        and height >= 24
+        and width >= 64
+    ):
+        draw_latency_panel(
+            stdscr,
+            latency_metrics,
+            height - 12
+        )
 
     if height > 1:
-        safe_addstr(stdscr, height - 1, 0, "Press Q to quit")
+        safe_addstr(
+            stdscr,
+            height - 1,
+            0,
+            "Press Q to quit"
+        )
 
     stdscr.refresh()
 
@@ -258,6 +501,17 @@ def main(stdscr, engine=None, options=None):
     if options is None:
         options = parse_args([])
 
+    # Initialize terminal colors before using curses color pairs.
+    try:
+        curses.start_color()
+        curses.init_pair(
+            1,
+            curses.COLOR_RED,
+            curses.COLOR_BLACK
+        )
+    except curses.error:
+        pass
+
     stdscr.timeout(options.refresh_ms)
 
     seen_order_ids = set()
@@ -265,10 +519,15 @@ def main(stdscr, engine=None, options=None):
 
     while True:
         now = time.monotonic()
+
         order_book = engine.get_order_book()
         trades = engine.get_trades()
 
-        observed_ids = get_observed_order_ids(order_book, trades)
+        observed_ids = get_observed_order_ids(
+            order_book,
+            trades
+        )
+
         new_order_ids = observed_ids - seen_order_ids
         seen_order_ids.update(new_order_ids)
 
@@ -281,7 +540,9 @@ def main(stdscr, engine=None, options=None):
         ):
             recent_order_times.popleft()
 
-        ops = int(len(recent_order_times) / options.ops_window)
+        ops = int(
+            len(recent_order_times) / options.ops_window
+        )
 
         latency_metrics = engine.get_latency_metrics()
 
@@ -294,12 +555,14 @@ def main(stdscr, engine=None, options=None):
         )
 
         key = stdscr.getch()
+
         if key in (ord("q"), ord("Q")):
             break
 
         if key == curses.KEY_RESIZE:
             if hasattr(curses, "update_lines_cols"):
                 curses.update_lines_cols()
+
             stdscr.clearok(True)
             stdscr.erase()
 
@@ -308,7 +571,9 @@ def launch_dashboard(options, engine=None):
     if engine is None:
         engine = MatchingEngine()
 
-    curses.wrapper(lambda stdscr: main(stdscr, engine, options))
+    curses.wrapper(
+        lambda stdscr: main(stdscr, engine, options)
+    )
 
 
 if __name__ == "__main__":
