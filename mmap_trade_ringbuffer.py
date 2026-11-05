@@ -1,14 +1,23 @@
+
 import mmap
 import os
 import struct
+import time
 from contextlib import contextmanager
 
 from trade_schema import TRADE_STRUCT, pack_trade, unpack_trade
+from shutdown_signal import POISON_PILL
 
 
 # Header fields:
 # write_index, item_count, read_index, unread_count, sequence_number
 HEADER = struct.Struct("<IIIIQ")
+
+# A valid trade cannot contain all-zero fields because trade IDs,
+# order IDs, and quantity must be positive.
+
+POISON_PILL_RECORD = TRADE_STRUCT.pack(
+    0, 0, 0, 0.0, 0, 0)
 
 
 class MmapTradeRingBuffer:
@@ -19,10 +28,13 @@ class MmapTradeRingBuffer:
         Raise BufferError instead of overwriting unread trades.
 
     Zero-copy API:
-        read_next_view() returns a memoryview backed directly by mmap.
-        After processing the view:
-            view.release()
-            consume()
+        read_next_view() returns an mmap-backed memoryview.
+        Release the view before calling consume().
+
+    Graceful shutdown:
+        shutdown() writes a reserved poison-pill record.
+        The consumer receives POISON_PILL after all pending trades.
+        The marker is not consumed, keeping the buffer permanently shut down.
     """
 
     def __init__(self, filename, capacity):
@@ -51,7 +63,6 @@ class MmapTradeRingBuffer:
                 )
 
         self.file = open(filename, "r+b")
-
         self.lock_file = open(self.lock_filename, "a+b")
 
         self.lock_file.seek(0, os.SEEK_END)
@@ -68,7 +79,6 @@ class MmapTradeRingBuffer:
         with self._lock():
             header = self._read_header()
 
-            # Initialize a new or zero-filled header.
             if header == (0, 0, 0, 0, 0):
                 self._write_header(0, 0, 0, 0, 0)
 
@@ -86,11 +96,13 @@ class MmapTradeRingBuffer:
 
         if os.name == "nt":
             import msvcrt
+
             msvcrt.locking(
                 self.lock_file.fileno(),
                 msvcrt.LK_LOCK,
                 1
             )
+
             try:
                 yield
             finally:
@@ -102,11 +114,19 @@ class MmapTradeRingBuffer:
                 )
         else:
             import fcntl
-            fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX)
+
+            fcntl.flock(
+                self.lock_file.fileno(),
+                fcntl.LOCK_EX
+            )
+
             try:
                 yield
             finally:
-                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(
+                    self.lock_file.fileno(),
+                    fcntl.LOCK_UN
+                )
 
     def _read_header(self):
         return HEADER.unpack(self.mm[:self.header_size])
@@ -126,6 +146,46 @@ class MmapTradeRingBuffer:
             unread_count,
             sequence_number
         )
+
+    def _record_offset(self, index):
+        return self.header_size + (
+            index * self.record_size
+        )
+
+    def _contains_poison_locked(self):
+        """
+        Check whether the shutdown marker exists among unread records.
+        Caller must hold the shared lock.
+        """
+        (
+            write_index,
+            item_count,
+            read_index,
+            unread_count,
+            sequence_number
+        ) = self._read_header()
+
+        index = read_index
+
+        for _ in range(unread_count):
+            offset = self._record_offset(index)
+
+            record = self.mm[
+                offset:offset + self.record_size
+            ]
+
+            if record == POISON_PILL_RECORD:
+                return True
+
+            index = (index + 1) % self.capacity
+
+        return False
+
+    @property
+    def is_shutdown(self):
+        """Return True once a shutdown marker has been published."""
+        with self._lock():
+            return self._contains_poison_locked()
 
     def push_trade(
         self,
@@ -154,16 +214,22 @@ class MmapTradeRingBuffer:
                 sequence_number
             ) = self._read_header()
 
-            if unread_count >= self.capacity:
-                raise BufferError(
-                    "Trade ring buffer is full; unread trades cannot be overwritten"
+            if self._contains_poison_locked():
+                raise RuntimeError(
+                    "Cannot publish trades after shutdown"
                 )
 
-            offset = self.header_size + (
-                write_index * self.record_size
-            )
+            if unread_count >= self.capacity:
+                raise BufferError(
+                    "Trade ring buffer is full; "
+                    "unread trades cannot be overwritten"
+                )
 
-            self.mm[offset:offset + self.record_size] = record
+            offset = self._record_offset(write_index)
+
+            self.mm[
+                offset:offset + self.record_size
+            ] = record
 
             write_index = (write_index + 1) % self.capacity
             item_count = min(item_count + 1, self.capacity)
@@ -180,12 +246,91 @@ class MmapTradeRingBuffer:
 
             return sequence_number
 
+    def shutdown(self, timeout=5.0, poll_interval=0.01):
+        """
+        Publish a poison pill after all pending trades.
+
+        If the buffer is full, wait for the consumer to free a slot.
+        Return True if this call publishes the marker.
+        Return False if shutdown was already published.
+        Raise TimeoutError if no slot becomes available in time.
+        """
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout cannot be negative")
+
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+
+        deadline = (
+            None if timeout is None
+            else time.monotonic() + timeout
+        )
+
+        while True:
+            with self._lock():
+                (
+                    write_index,
+                    item_count,
+                    read_index,
+                    unread_count,
+                    sequence_number
+                ) = self._read_header()
+
+                if self._contains_poison_locked():
+                    return False
+
+                if unread_count < self.capacity:
+                    offset = self._record_offset(write_index)
+
+                    self.mm[
+                        offset:offset + self.record_size
+                    ] = POISON_PILL_RECORD
+
+                    write_index = (
+                        write_index + 1
+                    ) % self.capacity
+
+                    item_count = min(
+                        item_count + 1,
+                        self.capacity
+                    )
+
+                    unread_count += 1
+                    sequence_number += 1
+
+                    self._write_header(
+                        write_index,
+                        item_count,
+                        read_index,
+                        unread_count,
+                        sequence_number
+                    )
+
+                    return True
+
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Timed out waiting for free space "
+                        "to publish shutdown marker"
+                    )
+
+                time.sleep(min(poll_interval, remaining))
+            else:
+                time.sleep(poll_interval)
+
     def read_next_view(self):
         """
         Return a zero-copy memoryview of the next unread trade.
 
-        Do not call consume() until processing is complete.
-        Release the returned view before calling consume().
+        Returns:
+            None: buffer is empty.
+            POISON_PILL: shutdown marker reached.
+            memoryview: normal trade record.
+
+        Release a normal memoryview before calling consume().
         """
         with self._lock():
             (
@@ -199,16 +344,21 @@ class MmapTradeRingBuffer:
             if unread_count == 0:
                 return None
 
-            offset = self.header_size + (
-                read_index * self.record_size
-            )
+            offset = self._record_offset(read_index)
+
+            record = self.mm[
+                offset:offset + self.record_size
+            ]
+
+            if record == POISON_PILL_RECORD:
+                return POISON_PILL
 
             return memoryview(self.mm)[
                 offset:offset + self.record_size
             ]
 
     def consume(self):
-        """Mark the next unread trade as consumed."""
+        """Consume the next normal trade, never the shutdown marker."""
         with self._lock():
             (
                 write_index,
@@ -219,7 +369,20 @@ class MmapTradeRingBuffer:
             ) = self._read_header()
 
             if unread_count == 0:
-                raise IndexError("No unread trades to consume")
+                raise IndexError(
+                    "No unread trades to consume"
+                )
+
+            offset = self._record_offset(read_index)
+
+            record = self.mm[
+                offset:offset + self.record_size
+            ]
+
+            if record == POISON_PILL_RECORD:
+                raise RuntimeError(
+                    "Cannot consume the shutdown marker"
+                )
 
             read_index = (read_index + 1) % self.capacity
             unread_count -= 1
@@ -238,6 +401,9 @@ class MmapTradeRingBuffer:
 
         if view is None:
             return None
+
+        if view is POISON_PILL:
+            return POISON_PILL
 
         try:
             record = bytes(view)
@@ -265,7 +431,8 @@ class MmapTradeRingBuffer:
                 "unread": unread_count,
                 "write_index": write_index,
                 "read_index": read_index,
-                "sequence_number": sequence_number
+                "sequence_number": sequence_number,
+                "is_shutdown": self._contains_poison_locked()
             }
 
     def close(self):

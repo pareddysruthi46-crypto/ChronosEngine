@@ -4,9 +4,14 @@ import mmap
 import os
 import struct
 import msvcrt
+import time
+
 from contextlib import contextmanager
 
 from order_schema import ORDER_STRUCT, pack_order, unpack_order
+from shutdown_signal import POISON_PILL
+
+POISON_PILL_RECORD = ORDER_STRUCT.pack(0, b"\0", 0.0, 0, 0)
 
 
 class MMapRingBuffer:
@@ -32,11 +37,9 @@ class MMapRingBuffer:
         self._closed = False
 
         try:
-            # Ensure parent directory exists.
             parent = os.path.dirname(os.path.abspath(filename))
             os.makedirs(parent, exist_ok=True)
 
-            # Create/open shared lock file.
             self.lock_file = open(self.lock_filename, "a+b")
             self.lock_file.seek(0, os.SEEK_END)
 
@@ -44,7 +47,6 @@ class MMapRingBuffer:
                 self.lock_file.write(b"\0")
                 self.lock_file.flush()
 
-            # Initialize or open the shared data file.
             with self._locked():
                 if (
                     not os.path.exists(self.filename)
@@ -94,7 +96,6 @@ class MMapRingBuffer:
 
             raise
 
-        # Register cleanup only after successful initialization.
         atexit.register(self.close)
 
     @contextmanager
@@ -119,6 +120,35 @@ class MMapRingBuffer:
     def _get_state(self):
         return self.HEADER.unpack_from(self.mm, 0)
 
+    def _contains_poison_locked(self):
+        """Check all unread records for the shutdown marker."""
+        (
+            write_index,
+            item_count,
+            read_index,
+            unread_count,
+            seq,
+        ) = self._get_state()
+
+        for i in range(unread_count):
+            index = (read_index + i) % self.capacity
+            offset = self.header_size + index * self.record_size
+
+            record = bytes(
+                self.mm[offset:offset + self.record_size]
+            )
+
+            if record == POISON_PILL_RECORD:
+                return True
+
+        return False
+
+    @property
+    def is_shutdown(self):
+        """Check whether a shutdown marker is waiting in the buffer."""
+        with self._locked():
+            return self._contains_poison_locked()
+
     @property
     def sequence_number(self):
         with self._locked():
@@ -135,6 +165,7 @@ class MMapRingBuffer:
             return self._get_state()[3]
 
     def push(self, order):
+        """Push an order unless shutdown has already been requested."""
         record = pack_order(
             order["order_id"],
             order["side"],
@@ -144,6 +175,11 @@ class MMapRingBuffer:
         )
 
         with self._locked():
+            if self._contains_poison_locked():
+                raise RuntimeError(
+                    "Cannot push orders after shutdown has been requested"
+                )
+
             (
                 write_index,
                 item_count,
@@ -155,6 +191,7 @@ class MMapRingBuffer:
             offset = (
                 self.header_size + write_index * self.record_size
             )
+
             self.mm[offset:offset + self.record_size] = record
 
             if item_count == self.capacity:
@@ -177,9 +214,90 @@ class MMapRingBuffer:
                 unread_count,
                 seq,
             )
+
             self.mm.flush()
 
+    def shutdown(self, timeout=5.0, poll_interval=0.01):
+        """
+        Publish a shutdown marker after pending orders.
+
+        Wait for available space instead of overwriting unread orders.
+
+        Returns:
+            True: marker successfully published.
+            False: marker was already published.
+
+        Raises:
+            TimeoutError: buffer remained full until timeout.
+        """
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout cannot be negative")
+
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+
+        deadline = (
+            None if timeout is None
+            else time.monotonic() + timeout
+        )
+
+        while True:
+            with self._locked():
+                if self._contains_poison_locked():
+                    return False
+
+                (
+                    write_index,
+                    item_count,
+                    read_index,
+                    unread_count,
+                    seq,
+                ) = self._get_state()
+
+                if unread_count < self.capacity:
+                    offset = (
+                        self.header_size
+                        + write_index * self.record_size
+                    )
+
+                    self.mm[
+                        offset:offset + self.record_size
+                    ] = POISON_PILL_RECORD
+
+                    write_index = (
+                        write_index + 1
+                    ) % self.capacity
+
+                    item_count = min(
+                        item_count + 1, self.capacity
+                    )
+
+                    unread_count += 1
+                    seq += 1
+
+                    self.HEADER.pack_into(
+                        self.mm,
+                        0,
+                        write_index,
+                        item_count,
+                        read_index,
+                        unread_count,
+                        seq,
+                    )
+
+                    self.mm.flush()
+                    return True
+
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Could not publish shutdown marker: "
+                    "order ring buffer remained full"
+                )
+
+            time.sleep(poll_interval)
+
     def read_next(self):
+        """Read the next order or return POISON_PILL when shutting down."""
         with self._locked():
             (
                 write_index,
@@ -195,9 +313,14 @@ class MMapRingBuffer:
             offset = (
                 self.header_size + read_index * self.record_size
             )
+
             record = bytes(
                 self.mm[offset:offset + self.record_size]
             )
+
+            # Do not consume the poison pill.
+            if record == POISON_PILL_RECORD:
+                return POISON_PILL
 
             read_index = (read_index + 1) % self.capacity
             unread_count -= 1
@@ -212,6 +335,7 @@ class MMapRingBuffer:
                 unread_count,
                 seq,
             )
+
             self.mm.flush()
 
             return unpack_order(record)
@@ -220,8 +344,8 @@ class MMapRingBuffer:
         """Return a memoryview of a copied record."""
         order = self.read_next()
 
-        if order is None:
-            return None
+        if order is None or order is POISON_PILL:
+            return order
 
         record = pack_order(
             order["order_id"],
@@ -230,9 +354,15 @@ class MMapRingBuffer:
             order["quantity"],
             order["timestamp"],
         )
+
         return memoryview(record)
 
     def read_all(self):
+        """
+        Return retained historical orders.
+
+        The poison pill is excluded from the returned order list.
+        """
         with self._locked():
             (
                 write_index,
@@ -250,24 +380,27 @@ class MMapRingBuffer:
 
             for i in range(item_count):
                 index = (start_index + i) % self.capacity
+
                 offset = (
                     self.header_size + index * self.record_size
                 )
+
                 record = bytes(
                     self.mm[offset:offset + self.record_size]
                 )
+
+                if record == POISON_PILL_RECORD:
+                    continue
+
                 orders.append(unpack_order(record))
 
             return orders
 
     def close(self):
         """Flush and release all ring-buffer resources safely."""
-
         if self._closed:
             return
 
-        # Do not close resources while another thread holds the lock.
-        # The OS releases the process-level file lock when the handle closes.
         error = None
 
         if self.mm is not None:
@@ -282,8 +415,6 @@ class MMapRingBuffer:
             except Exception as exc:
                 if error is None:
                     error = exc
-
-                # Keep resources available for a later cleanup attempt.
                 raise error
 
         if self.file is not None:

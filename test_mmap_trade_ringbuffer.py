@@ -1,8 +1,12 @@
+
 import os
 import tempfile
 import unittest
 
-from mmap_trade_ringbuffer import MmapTradeRingBuffer
+from mmap_trade_ringbuffer import (
+    MmapTradeRingBuffer,
+    POISON_PILL
+)
 
 
 class TestMmapTradeRingBuffer(unittest.TestCase):
@@ -35,6 +39,7 @@ class TestMmapTradeRingBuffer(unittest.TestCase):
         self.assertEqual(stats["capacity"], 3)
         self.assertEqual(stats["unread"], 0)
         self.assertEqual(stats["available"], 3)
+        self.assertFalse(stats["is_shutdown"])
 
     def test_push_and_read_trade(self):
         self.add_trade(1)
@@ -61,12 +66,21 @@ class TestMmapTradeRingBuffer(unittest.TestCase):
         self.add_trade(2)
         self.add_trade(3)
 
-        self.assertEqual(self.buffer.read_next()["trade_id"], 1)
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 1
+        )
+
         self.add_trade(4)
 
-        self.assertEqual(self.buffer.read_next()["trade_id"], 2)
-        self.assertEqual(self.buffer.read_next()["trade_id"], 3)
-        self.assertEqual(self.buffer.read_next()["trade_id"], 4)
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 2
+        )
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 3
+        )
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 4
+        )
 
     def test_zero_copy_view(self):
         self.add_trade(10)
@@ -74,6 +88,7 @@ class TestMmapTradeRingBuffer(unittest.TestCase):
         view = self.buffer.read_next_view()
 
         self.assertIsNotNone(view)
+        self.assertIsInstance(view, memoryview)
         self.assertEqual(len(view), 44)
 
         view.release()
@@ -92,6 +107,114 @@ class TestMmapTradeRingBuffer(unittest.TestCase):
             self.buffer.get_stats()["sequence_number"],
             2
         )
+
+    # -----------------------------------------
+    # POISON PILL / GRACEFUL SHUTDOWN TESTS
+    # -----------------------------------------
+
+    def test_shutdown_signal_after_pending_trades(self):
+        self.add_trade(1)
+        self.add_trade(2)
+
+        self.assertTrue(self.buffer.shutdown())
+        self.assertTrue(self.buffer.is_shutdown)
+
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 1
+        )
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 2
+        )
+
+        self.assertIs(
+            self.buffer.read_next(), POISON_PILL
+        )
+
+    def test_shutdown_prevents_new_trades(self):
+        self.add_trade(1)
+        self.buffer.shutdown()
+
+        with self.assertRaises(RuntimeError):
+            self.add_trade(2)
+
+    def test_repeated_shutdown_does_not_add_duplicate(self):
+        self.assertTrue(self.buffer.shutdown())
+        self.assertFalse(self.buffer.shutdown())
+
+        self.assertEqual(
+            self.buffer.get_stats()["unread"], 1
+        )
+
+    def test_shutdown_waits_when_buffer_is_full(self):
+        self.add_trade(1)
+        self.add_trade(2)
+        self.add_trade(3)
+
+        with self.assertRaises(TimeoutError):
+            self.buffer.shutdown(timeout=0.05)
+
+        self.assertEqual(
+            self.buffer.get_stats()["unread"], 3
+        )
+        self.assertFalse(self.buffer.is_shutdown)
+
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 1
+        )
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 2
+        )
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 3
+        )
+
+        self.assertTrue(self.buffer.shutdown())
+
+    def test_shutdown_does_not_overwrite_pending_trades(self):
+        self.add_trade(1)
+        self.add_trade(2)
+        self.add_trade(3)
+
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 1
+        )
+
+        self.assertTrue(self.buffer.shutdown())
+
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 2
+        )
+        self.assertEqual(
+            self.buffer.read_next()["trade_id"], 3
+        )
+
+        self.assertIs(
+            self.buffer.read_next(), POISON_PILL
+        )
+
+    def test_zero_copy_api_detects_shutdown_marker(self):
+        self.buffer.shutdown()
+
+        result = self.buffer.read_next_view()
+
+        self.assertIs(result, POISON_PILL)
+
+        with self.assertRaises(RuntimeError):
+            self.buffer.consume()
+
+        self.assertTrue(self.buffer.is_shutdown)
+
+    def test_shutdown_marker_is_reported_in_stats(self):
+        self.assertFalse(
+            self.buffer.get_stats()["is_shutdown"]
+        )
+
+        self.buffer.shutdown()
+
+        stats = self.buffer.get_stats()
+
+        self.assertTrue(stats["is_shutdown"])
+        self.assertEqual(stats["unread"], 1)
 
 
 if __name__ == "__main__":

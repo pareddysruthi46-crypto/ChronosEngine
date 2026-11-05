@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 
-from mmap_ringbuffer import MMapRingBuffer
+from mmap_ringbuffer import MMapRingBuffer, POISON_PILL
 
 
 def make_order(order_id):
@@ -78,10 +78,12 @@ class TestRingBufferBoundaryAndWraparound(unittest.TestCase):
             [order["order_id"] for order in self.buffer.read_all()],
             [3, 4, 5],
         )
+
         self.assertEqual(
             [self.buffer.read_next()["order_id"] for _ in range(3)],
             [3, 4, 5],
         )
+
         self.assertIsNone(self.buffer.read_next())
 
     def test_zero_capacity_is_rejected(self):
@@ -103,6 +105,7 @@ class TestRingBufferBoundaryAndWraparound(unittest.TestCase):
 
         with MMapRingBuffer(filename, capacity=3) as buffer:
             buffer.push(make_order(10))
+
             self.assertEqual(
                 buffer.read_all()[0]["order_id"], 10
             )
@@ -117,6 +120,80 @@ class TestRingBufferBoundaryAndWraparound(unittest.TestCase):
 
         self.assertTrue(os.path.exists(self.filename))
         self.assertGreater(os.path.getsize(self.filename), 0)
+
+    # -----------------------------------------
+    # POISON PILL / GRACEFUL SHUTDOWN TESTS
+    # -----------------------------------------
+
+    def test_shutdown_signal_after_pending_orders(self):
+        self.buffer.push(make_order(1))
+        self.buffer.push(make_order(2))
+
+        self.assertTrue(self.buffer.shutdown())
+
+        self.assertEqual(
+            self.buffer.read_next()["order_id"], 1
+        )
+        self.assertEqual(
+            self.buffer.read_next()["order_id"], 2
+        )
+
+        self.assertIs(
+            self.buffer.read_next(), POISON_PILL
+        )
+
+    def test_shutdown_prevents_new_orders(self):
+        self.buffer.push(make_order(1))
+        self.buffer.shutdown()
+
+        with self.assertRaises(RuntimeError):
+            self.buffer.push(make_order(2))
+
+    def test_repeated_shutdown_does_not_add_duplicate(self):
+        self.assertTrue(self.buffer.shutdown())
+        self.assertFalse(self.buffer.shutdown())
+
+        self.assertEqual(self.buffer.unread_count, 1)
+
+    def test_shutdown_waits_when_buffer_is_full(self):
+        for order_id in (1, 2, 3):
+            self.buffer.push(make_order(order_id))
+
+        with self.assertRaises(TimeoutError):
+            self.buffer.shutdown(timeout=0.05)
+
+        self.assertEqual(self.buffer.unread_count, 3)
+        self.assertFalse(self.buffer.is_shutdown)
+
+        self.assertEqual(
+            [
+                self.buffer.read_next()["order_id"]
+                for _ in range(3)
+            ],
+            [1, 2, 3],
+        )
+
+    def test_shutdown_does_not_overwrite_pending_orders(self):
+        for order_id in (1, 2, 3):
+            self.buffer.push(make_order(order_id))
+
+        # Consume one order to make room for the shutdown marker.
+        self.assertEqual(
+            self.buffer.read_next()["order_id"], 1
+        )
+
+        self.assertTrue(self.buffer.shutdown())
+
+        self.assertEqual(
+            self.buffer.read_next()["order_id"], 2
+        )
+        self.assertEqual(
+            self.buffer.read_next()["order_id"], 3
+        )
+
+        self.assertIs(
+            self.buffer.read_next(), POISON_PILL
+        )
 
 
 if __name__ == "__main__":
