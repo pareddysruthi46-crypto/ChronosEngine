@@ -151,5 +151,41 @@ class TestTradeLedgerSchema(unittest.TestCase):
                 connection.close()
 
 
+    def test_initialization_is_safe_to_repeat(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = os.path.join(folder, "trades.db")
+
+            initialize_database(database)
+            initialize_database(database)
+
+            connection = sqlite3.connect(database)
+
+            try:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM trades"
+                ).fetchone()[0]
+
+                self.assertEqual(count, 0)
+            finally:
+                connection.close()
+
+    def test_database_uses_wal_mode(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = os.path.join(folder, "trades.db")
+
+            initialize_database(database)
+
+            connection = sqlite3.connect(database)
+
+            try:
+                journal_mode = connection.execute(
+                    "PRAGMA journal_mode"
+                ).fetchone()[0]
+
+                self.assertEqual(journal_mode.lower(), "wal")
+            finally:
+                connection.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
