@@ -4,6 +4,7 @@ import mmap
 import os
 import struct
 import msvcrt
+import threading
 import time
 
 from contextlib import contextmanager
@@ -35,6 +36,7 @@ class MMapRingBuffer:
         self.mm = None
         self.lock_file = None
         self._closed = False
+        self._thread_lock = threading.RLock()
 
         try:
             parent = os.path.dirname(os.path.abspath(filename))
@@ -100,22 +102,31 @@ class MMapRingBuffer:
 
     @contextmanager
     def _locked(self):
-        """Acquire a one-byte lock shared by processes on Windows."""
-        if self._closed or self.lock_file is None:
-            raise RuntimeError("Ring buffer is closed")
-
-        self.lock_file.seek(0)
-        msvcrt.locking(
-            self.lock_file.fileno(), msvcrt.LK_LOCK, 1
-        )
+        """Acquire thread-level and process-level locks."""
+        self._thread_lock.acquire()
+        file_locked = False
 
         try:
-            yield
-        finally:
+            if self._closed or self.lock_file is None:
+                raise RuntimeError("Ring buffer is closed")
+
             self.lock_file.seek(0)
             msvcrt.locking(
-                self.lock_file.fileno(), msvcrt.LK_UNLCK, 1
+                self.lock_file.fileno(), msvcrt.LK_LOCK, 1
             )
+            file_locked = True
+
+            yield
+
+        finally:
+            try:
+                if file_locked:
+                    self.lock_file.seek(0)
+                    msvcrt.locking(
+                        self.lock_file.fileno(), msvcrt.LK_UNLCK, 1
+                    )
+            finally:
+                self._thread_lock.release()
 
     def _get_state(self):
         return self.HEADER.unpack_from(self.mm, 0)
