@@ -1,0 +1,36 @@
+CHRONOSENGINE MATCHING LATENCY BENCHMARK
+================================================
+Generated UTC: 2026-11-06T16:04:03.413435+00:00
+Python version: 3.14.4 (tags/v3.14.4:23116f9, Apr  7 2026, 14:10:54) [MSC v.1944 64 bit (AMD64)]
+Platform: Windows-11-10.0.26300-SP0
+
+WORKLOAD
+Warm-up orders: 1000
+Measured orders per run: 10000
+Measured runs: 5
+Total measured matching operations: 50000
+Total verified trades: 50000
+
+END-TO-END submit_order() LATENCY
+Average: 1.366 µs
+Median (P50): 1.200 µs
+P90: 1.500 µs
+P99: 3.200 µs
+Minimum: 0.900 µs
+Maximum: 609.200 µs
+Operations below 50 us: 49981
+Percentage below 50 us: 99.962%
+
+PER-RUN RESULTS
+Run 1: average=1.489 µs, P50=1.200 µs, P99=4.100 µs, max=609.200 µs, trades=10000
+Run 2: average=1.342 µs, P50=1.100 µs, P99=3.000 µs, max=454.700 µs, trades=10000
+Run 3: average=1.365 µs, P50=1.100 µs, P99=3.000 µs, max=442.500 µs, trades=10000
+Run 4: average=1.353 µs, P50=1.200 µs, P99=2.700 µs, max=396.500 µs, trades=10000
+Run 5: average=1.283 µs, P50=1.100 µs, P99=2.600 µs, max=282.500 µs, trades=10000
+
+TARGET: P99 latency below 50 microseconds
+FINAL RESULT: PASS
+
+Note: Latency measures the Python-visible submit_order() call
+including the actual matching operation and trade recording.
+It does not measure the complete mmap producer-to-consumer pipeline.
