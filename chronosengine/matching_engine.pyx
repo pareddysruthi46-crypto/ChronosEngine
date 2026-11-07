@@ -5,15 +5,94 @@ from math import isfinite
 from time import perf_counter_ns
 
 
+cdef class OrderNodePool:
+    """Fixed-capacity pool of reusable C order nodes."""
+
+    cdef OrderNode* _nodes
+    cdef OrderNode* _free_head
+    cdef Py_ssize_t _capacity
+    cdef Py_ssize_t _available
+
+    def __cinit__(self, Py_ssize_t capacity=100000):
+        cdef Py_ssize_t i
+        cdef OrderNode* node
+
+        self._nodes = NULL
+        self._free_head = NULL
+        self._capacity = 0
+        self._available = 0
+
+        if capacity <= 0:
+            raise ValueError("Pool capacity must be positive")
+
+        self._nodes = <OrderNode*>malloc(
+            capacity * sizeof(OrderNode)
+        )
+
+        if self._nodes == NULL:
+            raise MemoryError("Unable to allocate order node pool")
+
+        self._capacity = capacity
+        self._available = capacity
+
+        for i in range(capacity):
+            node = &self._nodes[i]
+            node.prev = NULL
+            node.next = self._free_head
+            self._free_head = node
+
+    def __dealloc__(self):
+        if self._nodes != NULL:
+            free(self._nodes)
+            self._nodes = NULL
+            self._free_head = NULL
+
+    cdef OrderNode* acquire(self) except NULL:
+        cdef OrderNode* node
+
+        if self._free_head == NULL:
+            raise MemoryError("Order node pool exhausted")
+
+        node = self._free_head
+        self._free_head = node.next
+
+        node.prev = NULL
+        node.next = NULL
+        self._available -= 1
+
+        return node
+
+    cdef void release(self, OrderNode* node) noexcept:
+        if node == NULL:
+            return
+
+        node.prev = NULL
+        node.next = self._free_head
+        self._free_head = node
+        self._available += 1
+
+    cdef bint has_available(self):
+        return self._available > 0
+
+    def get_stats(self):
+        return {
+            "capacity": self._capacity,
+            "available": self._available,
+            "in_use": self._capacity - self._available,
+        }
+
+
 cdef class OrderBookNode:
     cdef OrderNode* node
+    cdef OrderNodePool _pool
 
     def __cinit__(self):
         self.node = NULL
+        self._pool = OrderNodePool(1)
 
     def __dealloc__(self):
         if self.node != NULL:
-            free(self.node)
+            self._pool.release(self.node)
             self.node = NULL
 
     def set_order(
@@ -25,9 +104,7 @@ cdef class OrderBookNode:
         unsigned long long timestamp,
     ):
         if self.node == NULL:
-            self.node = <OrderNode*>malloc(sizeof(OrderNode))
-            if self.node == NULL:
-                raise MemoryError()
+            self.node = self._pool.acquire()
 
         self.node.order.order_id = order_id
         self.node.order.side = side
@@ -51,14 +128,16 @@ cdef class OrderBookNode:
 
 
 cdef class PriceLevelQueue:
-    """Doubly-linked FIFO queue for orders at one price level."""
+    """Doubly-linked FIFO queue using nodes from a shared pool."""
 
     cdef OrderNode* head
     cdef OrderNode* tail
+    cdef OrderNodePool _pool
 
-    def __cinit__(self):
+    def __cinit__(self, OrderNodePool pool):
         self.head = NULL
         self.tail = NULL
+        self._pool = pool
 
     def __dealloc__(self):
         cdef OrderNode* current
@@ -68,7 +147,7 @@ cdef class PriceLevelQueue:
 
         while current != NULL:
             following = current.next
-            free(current)
+            self._pool.release(current)
             current = following
 
         self.head = NULL
@@ -78,16 +157,11 @@ cdef class PriceLevelQueue:
         cdef OrderNode* node
         cdef OrderNode* current
 
-        node = <OrderNode*>malloc(sizeof(OrderNode))
-        if node == NULL:
-            raise MemoryError()
-
+        node = self._pool.acquire()
         node.order = order
         node.prev = NULL
         node.next = NULL
 
-        # Preserve timestamp priority.
-        # Equal timestamps retain insertion order.
         current = self.tail
 
         while (
@@ -131,7 +205,7 @@ cdef class PriceLevelQueue:
         else:
             self.tail = NULL
 
-        free(old_head)
+        self._pool.release(old_head)
 
     cdef bint remove_order(self, unsigned long long order_id):
         cdef OrderNode* current
@@ -150,7 +224,7 @@ cdef class PriceLevelQueue:
                 else:
                     self.tail = current.prev
 
-                free(current)
+                self._pool.release(current)
                 return True
 
             current = current.next
@@ -168,6 +242,8 @@ cdef class MatchingEngine:
     cdef dict _sells
     cdef list _trades
     cdef set _seen_order_ids
+    cdef dict _active_orders
+    cdef OrderNodePool _node_pool
 
     cdef unsigned long long _last_ingress_ns
     cdef unsigned long long _last_egress_ns
@@ -181,11 +257,13 @@ cdef class MatchingEngine:
 
     cdef object _rolling_latency
 
-    def __cinit__(self, latency_window_size=10000):
+    def __cinit__(self, latency_window_size=10000, node_pool_size=100000):
         self._buys = {}
         self._sells = {}
         self._trades = []
         self._seen_order_ids = set()
+        self._active_orders = {}
+        self._node_pool = OrderNodePool(node_pool_size)
 
         self._last_ingress_ns = 0
         self._last_egress_ns = 0
@@ -260,6 +338,9 @@ cdef class MatchingEngine:
             if order_id in self._seen_order_ids:
                 raise ValueError("order_id has already been used")
 
+            if not self._node_pool.has_available():
+                raise MemoryError("Order node pool exhausted")
+
             incoming.order_id = order_id
             incoming.side = 66 if side == "B" else 83
             incoming.price = price
@@ -268,16 +349,17 @@ cdef class MatchingEngine:
 
             if side == "B":
                 if price not in self._buys:
-                    self._buys[price] = PriceLevelQueue()
+                    self._buys[price] = PriceLevelQueue(self._node_pool)
 
                 queue = <PriceLevelQueue>self._buys[price]
             else:
                 if price not in self._sells:
-                    self._sells[price] = PriceLevelQueue()
+                    self._sells[price] = PriceLevelQueue(self._node_pool)
 
                 queue = <PriceLevelQueue>self._sells[price]
 
             queue.add_order(incoming)
+            self._active_orders[order_id] = (side, price)
             self._seen_order_ids.add(order_id)
 
             successful = True
@@ -287,30 +369,35 @@ cdef class MatchingEngine:
             self._finish_timing(successful)
 
     def cancel_order(self, unsigned long long order_id):
-        """Cancel an active order."""
+        """Cancel an active order using the order-ID-to-price index."""
 
+        cdef object location
+        cdef object side
         cdef double price
         cdef PriceLevelQueue queue
+        cdef dict levels
 
-        for price in list(self._buys.keys()):
-            queue = <PriceLevelQueue>self._buys[price]
+        location = self._active_orders.get(order_id)
 
-            if queue.remove_order(order_id):
-                if queue.is_empty():
-                    del self._buys[price]
+        if location is None:
+            return False
 
-                return True
+        side, price = location
+        levels = self._buys if side == "B" else self._sells
 
-        for price in list(self._sells.keys()):
-            queue = <PriceLevelQueue>self._sells[price]
+        if price not in levels:
+            raise RuntimeError("Active-order index is inconsistent with the order book")
 
-            if queue.remove_order(order_id):
-                if queue.is_empty():
-                    del self._sells[price]
+        queue = <PriceLevelQueue>levels[price]
 
-                return True
+        if not queue.remove_order(order_id):
+            raise RuntimeError("Active-order index is inconsistent with the order book")
 
-        return False
+        if queue.is_empty():
+            del levels[price]
+
+        del self._active_orders[order_id]
+        return True
 
     def submit_order(
         self,
@@ -331,7 +418,15 @@ cdef class MatchingEngine:
         cdef OrderNode* maker
         cdef PriceLevelQueue queue
         cdef double best_price
+        cdef unsigned long long maker_order_id
         cdef bint successful = False
+        cdef dict opposing_levels
+        cdef list opposing_prices
+        cdef double scan_price
+        cdef PriceLevelQueue scan_queue
+        cdef OrderNode* scan_node
+        cdef unsigned int preflight_remaining
+        cdef unsigned int reusable_nodes
 
         self._start_timing()
 
@@ -347,6 +442,51 @@ cdef class MatchingEngine:
 
             if order_id in self._seen_order_ids:
                 raise ValueError("order_id has already been used")
+
+            # Preflight matching without modifying the order book.
+            # Fully consumed maker orders release nodes that can be reused.
+            if side == "B":
+                opposing_levels = self._sells
+                opposing_prices = sorted(opposing_levels.keys())
+            else:
+                opposing_levels = self._buys
+                opposing_prices = sorted(
+                    opposing_levels.keys(),
+                    reverse=True,
+                )
+
+            preflight_remaining = quantity
+            reusable_nodes = 0
+
+            for scan_price in opposing_prices:
+                if side == "B":
+                    if price < scan_price:
+                        break
+                else:
+                    if price > scan_price:
+                        break
+
+                scan_queue = <PriceLevelQueue>opposing_levels[scan_price]
+                scan_node = scan_queue.head
+
+                while scan_node != NULL and preflight_remaining > 0:
+                    if scan_node.order.quantity <= preflight_remaining:
+                        preflight_remaining -= scan_node.order.quantity
+                        reusable_nodes += 1
+                    else:
+                        preflight_remaining = 0
+
+                    scan_node = scan_node.next
+
+                if preflight_remaining == 0:
+                    break
+
+            if (
+                preflight_remaining > 0
+                and not self._node_pool.has_available()
+                and reusable_nodes == 0
+            ):
+                raise MemoryError("Order node pool exhausted")
 
             side_code = 66 if side == "B" else 83
             original_quantity = quantity
@@ -368,6 +508,7 @@ cdef class MatchingEngine:
                         del self._sells[best_price]
                         continue
 
+                    maker_order_id = maker.order.order_id
                     trade_quantity = (
                         remaining
                         if remaining < maker.order.quantity
@@ -386,6 +527,7 @@ cdef class MatchingEngine:
                     maker.order.quantity -= trade_quantity
 
                     if maker.order.quantity == 0:
+                        self._active_orders.pop(maker_order_id, None)
                         queue.pop_head()
 
                     if queue.is_empty():
@@ -405,6 +547,7 @@ cdef class MatchingEngine:
                         del self._buys[best_price]
                         continue
 
+                    maker_order_id = maker.order.order_id
                     trade_quantity = (
                         remaining
                         if remaining < maker.order.quantity
@@ -423,6 +566,7 @@ cdef class MatchingEngine:
                     maker.order.quantity -= trade_quantity
 
                     if maker.order.quantity == 0:
+                        self._active_orders.pop(maker_order_id, None)
                         queue.pop_head()
 
                     if queue.is_empty():
@@ -437,17 +581,19 @@ cdef class MatchingEngine:
 
                 if side == "B":
                     if price not in self._buys:
-                        self._buys[price] = PriceLevelQueue()
+                        self._buys[price] = PriceLevelQueue(self._node_pool)
 
                     queue = <PriceLevelQueue>self._buys[price]
                     queue.add_order(incoming)
 
                 else:
                     if price not in self._sells:
-                        self._sells[price] = PriceLevelQueue()
+                        self._sells[price] = PriceLevelQueue(self._node_pool)
 
                     queue = <PriceLevelQueue>self._sells[price]
                     queue.add_order(incoming)
+
+                self._active_orders[order_id] = (side, price)
 
             filled = original_quantity - remaining
 
@@ -492,6 +638,9 @@ cdef class MatchingEngine:
 
     def get_trades(self):
         return list(self._trades)
+
+    def get_memory_pool_stats(self):
+        return self._node_pool.get_stats()
 
     def get_latency_metrics(self):
         """Return engine processing latency and rolling percentiles."""
