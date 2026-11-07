@@ -241,6 +241,7 @@ cdef class MatchingEngine:
     cdef dict _buys
     cdef dict _sells
     cdef list _trades
+    cdef list _sweep_events
     cdef set _seen_order_ids
     cdef dict _active_orders
     cdef OrderNodePool _node_pool
@@ -261,6 +262,7 @@ cdef class MatchingEngine:
         self._buys = {}
         self._sells = {}
         self._trades = []
+        self._sweep_events = []
         self._seen_order_ids = set()
         self._active_orders = {}
         self._node_pool = OrderNodePool(node_pool_size)
@@ -427,6 +429,10 @@ cdef class MatchingEngine:
         cdef OrderNode* scan_node
         cdef unsigned int preflight_remaining
         cdef unsigned int reusable_nodes
+        cdef list matched_price_levels
+        cdef double last_sweep_price
+        cdef unsigned int executed_quantity
+        cdef bint has_last_sweep_price
 
         self._start_timing()
 
@@ -492,6 +498,11 @@ cdef class MatchingEngine:
             original_quantity = quantity
             remaining = quantity
 
+            matched_price_levels = []
+            last_sweep_price = 0.0
+            executed_quantity = 0
+            has_last_sweep_price = False
+
             self._seen_order_ids.add(order_id)
 
             if side == "B":
@@ -514,6 +525,16 @@ cdef class MatchingEngine:
                         if remaining < maker.order.quantity
                         else maker.order.quantity
                     )
+
+                    if (
+                        not has_last_sweep_price
+                        or best_price != last_sweep_price
+                    ):
+                        matched_price_levels.append(best_price)
+                        last_sweep_price = best_price
+                        has_last_sweep_price = True
+
+                    executed_quantity += trade_quantity
 
                     self._trades.append({
                         "buy_order_id": order_id,
@@ -554,6 +575,16 @@ cdef class MatchingEngine:
                         else maker.order.quantity
                     )
 
+                    if (
+                        not has_last_sweep_price
+                        or best_price != last_sweep_price
+                    ):
+                        matched_price_levels.append(best_price)
+                        last_sweep_price = best_price
+                        has_last_sweep_price = True
+
+                    executed_quantity += trade_quantity
+
                     self._trades.append({
                         "buy_order_id": maker.order.order_id,
                         "sell_order_id": order_id,
@@ -571,6 +602,16 @@ cdef class MatchingEngine:
 
                     if queue.is_empty():
                         del self._buys[best_price]
+
+            if len(matched_price_levels) >= 2:
+                self._sweep_events.append({
+                    "order_id": order_id,
+                    "side": "BUY" if side == "B" else "SELL",
+                    "levels_swept": len(matched_price_levels),
+                    "executed_quantity": executed_quantity,
+                    "matched_price_levels": list(matched_price_levels),
+                    "timestamp": timestamp,
+                })
 
             if remaining > 0:
                 incoming.order_id = order_id
@@ -638,6 +679,15 @@ cdef class MatchingEngine:
 
     def get_trades(self):
         return list(self._trades)
+
+    def get_sweep_events(self):
+        return [
+            {
+                **event,
+                "matched_price_levels": list(event["matched_price_levels"]),
+            }
+            for event in self._sweep_events
+        ]
 
     def get_memory_pool_stats(self):
         return self._node_pool.get_stats()
