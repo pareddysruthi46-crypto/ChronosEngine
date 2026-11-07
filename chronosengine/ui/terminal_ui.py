@@ -12,6 +12,10 @@ OPS_WINDOW_SECONDS = 1.0
 # 50 microseconds = 50,000 nanoseconds
 SLA_THRESHOLD_NS = 50_000
 
+WHALE_ALERT_DURATION_SECONDS = 3.0
+WHALE_FLASH_INTERVAL_SECONDS = 0.25
+
+
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(
@@ -108,6 +112,71 @@ def get_best_spread(order_book):
     return best_ask - best_bid
 
 
+def detect_whale_sweeps(trades):
+    """Detect orders executed across multiple distinct price levels."""
+    grouped = {"BUY": {}, "SELL": {}}
+
+    for trade in trades:
+        try:
+            price = float(trade["price"])
+            quantity = float(trade["quantity"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if not (price > 0 and quantity > 0):
+            continue
+
+        for side, order_id in (
+            ("BUY", trade.get("buy_order_id")),
+            ("SELL", trade.get("sell_order_id")),
+        ):
+            if order_id is None:
+                continue
+
+            try:
+                group = grouped[side].setdefault(
+                    order_id,
+                    {"prices": set(), "quantity": 0.0},
+                )
+            except TypeError:
+                continue
+
+            group["prices"].add(price)
+            group["quantity"] += quantity
+
+    events = []
+
+    for side, orders in grouped.items():
+        for order_id, details in orders.items():
+            prices = sorted(details["prices"])
+
+            if len(prices) < 2:
+                continue
+
+            quantity = details["quantity"]
+            quantity_text = (
+                str(int(quantity))
+                if quantity.is_integer()
+                else f"{quantity:g}"
+            )
+
+            events.append({
+                "type": f"WHALE_{side}",
+                "side": side,
+                "order_id": order_id,
+                "executed_quantity": quantity,
+                "levels_hit": len(prices),
+                "matched_price_levels": prices,
+                "text": (
+                    f"!!! WHALE {side} SWEEP !!! "
+                    f"Order #{order_id} | Qty: {quantity_text} | "
+                    f"{len(prices)} LEVELS CLEARED | Prices: {prices}"
+                ),
+            })
+
+    return events
+
+
 def detect_order_events(
     previous_order_book,
     current_order_book,
@@ -175,17 +244,74 @@ def detect_order_events(
             ),
         })
 
+    for sweep in detect_whale_sweeps(new_trades):
+        sweep["detected_at"] = time.monotonic()
+        events.append(sweep)
+
     return events, len(trades), current_spread
 
 
-def draw_event_status(stdscr, events):
-    """Display the latest order-state event using its assigned color."""
-    if not events:
-        safe_addstr(stdscr, 4, 2, "LATEST EVENT: Waiting for order activity")
+def draw_event_status(stdscr, events, now=None):
+    """Display a flashing Whale alert or the latest normal event."""
+    if now is None:
+        now = time.monotonic()
+
+    active_whale = None
+
+    for event in reversed(events):
+        if event.get("type") not in ("WHALE_BUY", "WHALE_SELL"):
+            continue
+
+        detected_at = event.get("detected_at")
+        if detected_at is None:
+            continue
+
+        elapsed = now - detected_at
+
+        if 0 <= elapsed < WHALE_ALERT_DURATION_SECONDS:
+            active_whale = event
+            break
+
+    if active_whale is not None:
+        event = active_whale
+
+        phase = int(
+            (now - event["detected_at"]) /
+            WHALE_FLASH_INTERVAL_SECONDS
+        ) % 2
+
+        if event["type"] == "WHALE_BUY":
+            color_pair = 1 if phase == 0 else 3
+        else:
+            color_pair = 2 if phase == 0 else 3
+
+        attr = curses.A_BOLD
+
+        if phase == 1:
+            attr |= curses.A_REVERSE
+
+        try:
+            if curses.has_colors():
+                attr |= curses.color_pair(color_pair)
+        except curses.error:
+            pass
+
+        safe_addstr(stdscr, 4, 2, event["text"], attr)
         return
 
-    event = events[-1]
-    event_type = event["type"]
+    normal_events = [
+        event for event in events
+        if event.get("type") not in ("WHALE_BUY", "WHALE_SELL")
+    ]
+
+    if not normal_events:
+        safe_addstr(
+            stdscr, 4, 2,
+            "LATEST EVENT: Waiting for order activity"
+        )
+        return
+
+    event = normal_events[-1]
 
     color_pairs = {
         "FILL": 2,
@@ -197,17 +323,14 @@ def draw_event_status(stdscr, events):
 
     try:
         if curses.has_colors():
-            attr |= curses.color_pair(color_pairs[event_type])
+            pair = color_pairs.get(event["type"])
+            if pair is not None:
+                attr |= curses.color_pair(pair)
     except curses.error:
         pass
 
-    safe_addstr(
-        stdscr,
-        4,
-        2,
-        event["text"],
-        attr,
-    )
+    safe_addstr(stdscr, 4, 2, event["text"], attr)
+
 
 
 def count_sla_breaches(samples_ns, threshold_ns=SLA_THRESHOLD_NS):
