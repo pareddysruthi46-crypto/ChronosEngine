@@ -4,6 +4,8 @@ import curses
 import time
 from collections import deque
 
+from chronosengine.ui.system_telemetry import collect_system_health
+
 
 DEPTH_LEVELS = 5
 REFRESH_INTERVAL_MS = 250
@@ -546,13 +548,62 @@ def draw_latency_panel(stdscr, metrics, start_y):
     )
 
 
+def draw_system_health_panel(stdscr, telemetry, start_y=2, start_x=65):
+    """Display compact CPU, memory, buffer and trade statistics."""
+    if telemetry is None:
+        return
+
+    cpu = telemetry.get("cpu_percent")
+    cpu_text = f"{cpu:.1f}%" if cpu is not None else "N/A"
+
+    memory = telemetry.get("memory_pool")
+    if memory:
+        pool_text = (
+            f"Used: {memory.get('in_use', 'N/A')}/"
+            f"{memory.get('capacity', 'N/A')}  "
+            f"Free: {memory.get('available', 'N/A')}"
+        )
+    else:
+        pool_text = "Unavailable"
+
+    def buffer_text(name, stats):
+        if stats is None:
+            return f"{name}: NOT CONNECTED"
+
+        return (
+            f"{name}: {stats.get('unread', 'N/A')}/"
+            f"{stats.get('capacity', 'N/A')} unread  "
+            f"{stats.get('allocated_bytes', 'N/A')} B"
+        )
+
+    counters = telemetry.get("trade_counters", {})
+
+    lines = [
+        "SYSTEM HEALTH",
+        f"CPU: {cpu_text}",
+        "ENGINE NODE POOL",
+        pool_text,
+        buffer_text("ORDER BUFFER", telemetry.get("order_buffer")),
+        buffer_text("TRADE BUFFER", telemetry.get("trade_buffer")),
+        "TRADE COUNTERS",
+        f"Executions: {counters.get('executions', 0)}",
+        (
+            f"Buy: {counters.get('buy_participations', 0)}  "
+            f"Sell: {counters.get('sell_participations', 0)}"
+        ),
+    ]
+
+    for offset, line in enumerate(lines):
+        safe_addstr(stdscr, start_y + offset, start_x, line)
+
 def draw_layout(
     stdscr,
     order_book=None,
     ops=0,
     depth_levels=DEPTH_LEVELS,
     latency_metrics=None,
-    events=None
+    events=None,
+    telemetry=None
 ):
     try:
         curses.curs_set(0)
@@ -723,6 +774,10 @@ def draw_layout(
             "Enlarge terminal to at least 64 columns and 12 rows.",
         )
 
+    # Keep the health panel in the right column, away from the order book.
+    if telemetry is not None and height >= 14 and width >= 100:
+        draw_system_health_panel(stdscr, telemetry)
+
     # Keep histogram and SLA panel separate from the order book.
     if (
         latency_metrics is not None
@@ -746,7 +801,7 @@ def draw_layout(
     stdscr.refresh()
 
 
-def main(stdscr, engine=None, options=None):
+def main(stdscr, engine=None, options=None, order_buffer=None, trade_buffer=None):
     if engine is None:
         from chronosengine.matching_engine import MatchingEngine
         engine = MatchingEngine()
@@ -813,6 +868,12 @@ def main(stdscr, engine=None, options=None):
         )
 
         latency_metrics = engine.get_latency_metrics()
+        telemetry = collect_system_health(
+            engine,
+            trades,
+            order_buffer,
+            trade_buffer,
+        )
 
         draw_layout(
             stdscr,
@@ -821,6 +882,7 @@ def main(stdscr, engine=None, options=None):
             options.depth_levels,
             latency_metrics,
             list(event_log),
+            telemetry=telemetry,
         )
 
         key = stdscr.getch()
@@ -836,13 +898,15 @@ def main(stdscr, engine=None, options=None):
             stdscr.erase()
 
 
-def launch_dashboard(options, engine=None):
+def launch_dashboard(options, engine=None, order_buffer=None, trade_buffer=None):
     if engine is None:
         from chronosengine.matching_engine import MatchingEngine
         engine = MatchingEngine()
 
     curses.wrapper(
-        lambda stdscr: main(stdscr, engine, options)
+        lambda stdscr: main(
+            stdscr, engine, options, order_buffer, trade_buffer
+        )
     )
 
 

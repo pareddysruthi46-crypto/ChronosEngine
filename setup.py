@@ -1,5 +1,5 @@
-
 from pathlib import Path
+import os
 
 from Cython.Build import cythonize
 from setuptools import Extension, setup
@@ -15,7 +15,7 @@ if ENGINE_SOURCE.exists():
             name="chronosengine.matching_engine",
             sources=[str(ENGINE_SOURCE)],
             language="c++",
-            extra_compile_args=["/O2"] if __import__("os").name == "nt" else ["-O3"],
+            extra_compile_args=["/O2"] if os.name == "nt" else ["-O3"],
         )
     )
 
@@ -23,6 +23,7 @@ setup(
     name="chronosengine",
     version="0.1.0",
     description="High-performance financial order matching engine",
+    install_requires=["psutil>=7.0.0"],
     ext_modules=cythonize(
         extensions,
         compiler_directives={
