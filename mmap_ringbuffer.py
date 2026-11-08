@@ -11,6 +11,7 @@ from contextlib import contextmanager
 
 from order_schema import ORDER_STRUCT, pack_order, unpack_order
 from shutdown_signal import POISON_PILL
+from buffer_watermarks import BufferWatermarkMonitor
 
 POISON_PILL_RECORD = ORDER_STRUCT.pack(0, b"\0", 0.0, 0, 0)
 
@@ -37,6 +38,7 @@ class MMapRingBuffer:
         self.lock_file = None
         self._closed = False
         self._thread_lock = threading.RLock()
+        self._watermark_monitor = BufferWatermarkMonitor('order')
 
         try:
             parent = os.path.dirname(os.path.abspath(filename))
@@ -226,6 +228,9 @@ class MMapRingBuffer:
                 seq,
             )
 
+            self._watermark_monitor.update(
+                unread_count, self.capacity
+            )
             self.mm.flush()
 
     def shutdown(self, timeout=5.0, poll_interval=0.01):
@@ -296,6 +301,9 @@ class MMapRingBuffer:
                         seq,
                     )
 
+                    self._watermark_monitor.update(
+                        unread_count, self.capacity
+                    )
                     self.mm.flush()
                     return True
 
@@ -347,9 +355,37 @@ class MMapRingBuffer:
                 seq,
             )
 
+            self._watermark_monitor.update(
+                unread_count, self.capacity
+            )
             self.mm.flush()
 
             return unpack_order(record)
+
+    def get_stats(self):
+        with self._locked():
+            (
+                write_index,
+                item_count,
+                read_index,
+                unread_count,
+                sequence_number,
+            ) = self._get_state()
+
+            metrics = self._watermark_monitor.update(
+                unread_count, self.capacity
+            )
+
+            return {
+                "capacity": self.capacity,
+                "available": self.capacity - unread_count,
+                "unread": unread_count,
+                "write_index": write_index,
+                "read_index": read_index,
+                "sequence_number": sequence_number,
+                "is_shutdown": self._contains_poison_locked(),
+                **metrics,
+            }
 
     def read_next_view(self):
         """Return a memoryview of a copied record."""
