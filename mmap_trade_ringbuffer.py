@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 from trade_schema import TRADE_STRUCT, pack_trade, unpack_trade
 from shutdown_signal import POISON_PILL
+from buffer_watermarks import BufferWatermarkMonitor
 
 
 # Header fields:
@@ -51,6 +52,7 @@ class MmapTradeRingBuffer:
 
         self.lock_filename = filename + ".lock"
         self._closed = False
+        self._watermark_monitor = BufferWatermarkMonitor('trade')
 
         if not os.path.exists(filename):
             with open(filename, "wb") as file:
@@ -243,6 +245,9 @@ class MmapTradeRingBuffer:
                 unread_count,
                 sequence_number
             )
+            self._watermark_monitor.update(
+                unread_count, self.capacity
+            )
 
             return sequence_number
 
@@ -304,6 +309,9 @@ class MmapTradeRingBuffer:
                         read_index,
                         unread_count,
                         sequence_number
+                    )
+                    self._watermark_monitor.update(
+                        unread_count, self.capacity
                     )
 
                     return True
@@ -394,6 +402,9 @@ class MmapTradeRingBuffer:
                 unread_count,
                 sequence_number
             )
+            self._watermark_monitor.update(
+                unread_count, self.capacity
+            )
 
     def read_next(self):
         """Copy and return the next trade, then consume it."""
@@ -425,6 +436,10 @@ class MmapTradeRingBuffer:
                 sequence_number
             ) = self._read_header()
 
+            metrics = self._watermark_monitor.update(
+                unread_count, self.capacity
+            )
+
             return {
                 "capacity": self.capacity,
                 "available": self.capacity - unread_count,
@@ -432,7 +447,8 @@ class MmapTradeRingBuffer:
                 "write_index": write_index,
                 "read_index": read_index,
                 "sequence_number": sequence_number,
-                "is_shutdown": self._contains_poison_locked()
+                "is_shutdown": self._contains_poison_locked(),
+                **metrics
             }
 
     def close(self):
