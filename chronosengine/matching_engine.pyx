@@ -672,9 +672,24 @@ cdef class MatchingEngine:
         return result
 
     def get_order_book(self):
+        cdef list buys = self._get_side_orders(self._buys, True)
+        cdef list sells = self._get_side_orders(self._sells, False)
+        cdef object best_bid = max(self._buys.keys()) if self._buys else None
+        cdef object best_ask = min(self._sells.keys()) if self._sells else None
+        cdef object spread = None
+        cdef bint is_crossed = False
+
+        if best_bid is not None and best_ask is not None:
+            spread = best_ask - best_bid
+            is_crossed = best_bid >= best_ask
+
         return {
-            "buys": self._get_side_orders(self._buys, True),
-            "sells": self._get_side_orders(self._sells, False),
+            "buys": buys,
+            "sells": sells,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
+            "is_crossed": bool(is_crossed),
         }
 
     def get_trades(self):
