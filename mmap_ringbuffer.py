@@ -13,6 +13,7 @@ from order_schema import ORDER_STRUCT, pack_order, unpack_order
 from shutdown_signal import POISON_PILL
 from buffer_watermarks import BufferWatermarkMonitor
 
+
 POISON_PILL_RECORD = ORDER_STRUCT.pack(0, b"\0", 0.0, 0, 0)
 
 
@@ -31,14 +32,17 @@ class MMapRingBuffer:
         self.capacity = capacity
         self.record_size = ORDER_STRUCT.size
         self.header_size = self.HEADER.size
-        self.file_size = self.header_size + capacity * self.record_size
+        self.file_size = (
+            self.header_size + capacity * self.record_size
+        )
 
         self.file = None
         self.mm = None
         self.lock_file = None
         self._closed = False
+
         self._thread_lock = threading.RLock()
-        self._watermark_monitor = BufferWatermarkMonitor('order')
+        self._watermark_monitor = BufferWatermarkMonitor("order")
 
         try:
             parent = os.path.dirname(os.path.abspath(filename))
@@ -62,7 +66,8 @@ class MMapRingBuffer:
 
                     self.file = open(self.filename, "r+b")
                     self.mm = mmap.mmap(
-                        self.file.fileno(), self.file_size
+                        self.file.fileno(),
+                        self.file_size
                     )
 
                     self.HEADER.pack_into(
@@ -82,7 +87,8 @@ class MMapRingBuffer:
 
                     self.file = open(self.filename, "r+b")
                     self.mm = mmap.mmap(
-                        self.file.fileno(), self.file_size
+                        self.file.fileno(),
+                        self.file_size
                     )
 
         except Exception:
@@ -105,6 +111,7 @@ class MMapRingBuffer:
     @contextmanager
     def _locked(self):
         """Acquire thread-level and process-level locks."""
+
         self._thread_lock.acquire()
         file_locked = False
 
@@ -113,9 +120,13 @@ class MMapRingBuffer:
                 raise RuntimeError("Ring buffer is closed")
 
             self.lock_file.seek(0)
+
             msvcrt.locking(
-                self.lock_file.fileno(), msvcrt.LK_LOCK, 1
+                self.lock_file.fileno(),
+                msvcrt.LK_LOCK,
+                1
             )
+
             file_locked = True
 
             yield
@@ -124,8 +135,11 @@ class MMapRingBuffer:
             try:
                 if file_locked:
                     self.lock_file.seek(0)
+
                     msvcrt.locking(
-                        self.lock_file.fileno(), msvcrt.LK_UNLCK, 1
+                        self.lock_file.fileno(),
+                        msvcrt.LK_UNLCK,
+                        1
                     )
             finally:
                 self._thread_lock.release()
@@ -134,7 +148,13 @@ class MMapRingBuffer:
         return self.HEADER.unpack_from(self.mm, 0)
 
     def _contains_poison_locked(self):
-        """Check all unread records for the shutdown marker."""
+        """
+        Check whether the newest unread record is the shutdown marker.
+
+        Shutdown appends the poison pill as the newest record.
+        Further writes are rejected after the marker is published.
+        """
+
         (
             write_index,
             item_count,
@@ -143,22 +163,25 @@ class MMapRingBuffer:
             seq,
         ) = self._get_state()
 
-        for i in range(unread_count):
-            index = (read_index + i) % self.capacity
-            offset = self.header_size + index * self.record_size
+        if unread_count == 0:
+            return False
 
-            record = bytes(
-                self.mm[offset:offset + self.record_size]
-            )
+        last_index = (write_index - 1) % self.capacity
 
-            if record == POISON_PILL_RECORD:
-                return True
+        offset = (
+            self.header_size + last_index * self.record_size
+        )
 
-        return False
+        record = bytes(
+            self.mm[offset:offset + self.record_size]
+        )
+
+        return record == POISON_PILL_RECORD
 
     @property
     def is_shutdown(self):
         """Check whether a shutdown marker is waiting in the buffer."""
+
         with self._locked():
             return self._contains_poison_locked()
 
@@ -179,6 +202,7 @@ class MMapRingBuffer:
 
     def push(self, order):
         """Push an order unless shutdown has already been requested."""
+
         record = pack_order(
             order["order_id"],
             order["side"],
@@ -229,8 +253,89 @@ class MMapRingBuffer:
             )
 
             self._watermark_monitor.update(
-                unread_count, self.capacity
+                unread_count,
+                self.capacity
             )
+
+            self.mm.flush()
+
+    def push_packed(self, payload, flush=True):
+        """
+        Push an already-packed order record into the ring buffer.
+
+        flush=True preserves the original behavior.
+        Use flush=False for high-throughput batch workloads.
+        """
+
+        if not isinstance(
+            payload,
+            (bytes, bytearray, memoryview)
+        ):
+            raise TypeError(
+                "payload must be bytes, bytearray, or memoryview"
+            )
+
+        record = bytes(payload)
+
+        if len(record) != self.record_size:
+            raise ValueError(
+                f"Invalid record size: expected {self.record_size}, "
+                f"received {len(record)}"
+            )
+
+        with self._locked():
+            if self._contains_poison_locked():
+                raise RuntimeError(
+                    "Cannot push orders after shutdown has been requested"
+                )
+
+            (
+                write_index,
+                item_count,
+                read_index,
+                unread_count,
+                seq,
+            ) = self._get_state()
+
+            offset = (
+                self.header_size + write_index * self.record_size
+            )
+
+            self.mm[offset:offset + self.record_size] = record
+
+            if item_count == self.capacity:
+                if unread_count > 0 and read_index == write_index:
+                    read_index = (read_index + 1) % self.capacity
+                    unread_count -= 1
+            else:
+                item_count += 1
+
+            write_index = (write_index + 1) % self.capacity
+            unread_count = min(unread_count + 1, self.capacity)
+            seq += 1
+
+            self.HEADER.pack_into(
+                self.mm,
+                0,
+                write_index,
+                item_count,
+                read_index,
+                unread_count,
+                seq,
+            )
+
+            self._watermark_monitor.update(
+                unread_count,
+                self.capacity
+            )
+
+            if flush:
+                self.mm.flush()
+
+    def flush(self):
+        """Persist pending memory-mapped changes safely."""
+
+        with self._locked():
             self.mm.flush()
 
     def shutdown(self, timeout=5.0, poll_interval=0.01):
@@ -246,6 +351,7 @@ class MMapRingBuffer:
         Raises:
             TimeoutError: buffer remained full until timeout.
         """
+
         if timeout is not None and timeout < 0:
             raise ValueError("timeout cannot be negative")
 
@@ -285,7 +391,8 @@ class MMapRingBuffer:
                     ) % self.capacity
 
                     item_count = min(
-                        item_count + 1, self.capacity
+                        item_count + 1,
+                        self.capacity
                     )
 
                     unread_count += 1
@@ -302,9 +409,12 @@ class MMapRingBuffer:
                     )
 
                     self._watermark_monitor.update(
-                        unread_count, self.capacity
+                        unread_count,
+                        self.capacity
                     )
+
                     self.mm.flush()
+
                     return True
 
             if deadline is not None and time.monotonic() >= deadline:
@@ -317,6 +427,7 @@ class MMapRingBuffer:
 
     def read_next(self):
         """Read the next order or return POISON_PILL when shutting down."""
+
         with self._locked():
             (
                 write_index,
@@ -356,8 +467,10 @@ class MMapRingBuffer:
             )
 
             self._watermark_monitor.update(
-                unread_count, self.capacity
+                unread_count,
+                self.capacity
             )
+
             self.mm.flush()
 
             return unpack_order(record)
@@ -373,7 +486,8 @@ class MMapRingBuffer:
             ) = self._get_state()
 
             metrics = self._watermark_monitor.update(
-                unread_count, self.capacity
+                unread_count,
+                self.capacity
             )
 
             return {
@@ -389,6 +503,7 @@ class MMapRingBuffer:
 
     def read_next_view(self):
         """Return a memoryview of a copied record."""
+
         order = self.read_next()
 
         if order is None or order is POISON_PILL:
@@ -410,6 +525,7 @@ class MMapRingBuffer:
 
         The poison pill is excluded from the returned order list.
         """
+
         with self._locked():
             (
                 write_index,
@@ -445,6 +561,7 @@ class MMapRingBuffer:
 
     def close(self):
         """Flush and release all ring-buffer resources safely."""
+
         if self._closed:
             return
 
@@ -494,6 +611,7 @@ class MMapRingBuffer:
     def __enter__(self):
         if self._closed:
             raise RuntimeError("Ring buffer is already closed")
+
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
