@@ -718,3 +718,19 @@ The Cython matching engine can read individual fields directly from the original
 
 This design reduces Python-level serialization overhead and provides a foundation for efficient order communication between independent processes.
 
+## 13. IPC Testing and Finalization
+
+The IPC modules are verified through automated regression tests covering synchronization, concurrent access, trade transmission, and consumer lag monitoring.
+
+The verification process includes:
+
+1. Atomic sequence tests for ring buffer synchronization.
+2. Multi-threaded stress tests for concurrent producers and consumers.
+3. Trade ring buffer tests for insertion, retrieval, wraparound, and graceful shutdown.
+4. Buffer watermark tests for threshold alerts and consumer lag metrics.
+
+The regression test suite completed with 20 passing tests.
+
+Before deployment, verify that producer and consumer processes use the same buffer configuration and that shared memory resources are cleaned up correctly during shutdown.
+
+These checks improve IPC reliability and simplify future maintenance.
