@@ -2,6 +2,7 @@
 import mmap
 import os
 import struct
+import threading
 import time
 from contextlib import contextmanager
 
@@ -16,9 +17,9 @@ HEADER = struct.Struct("<IIIIQ")
 
 # A valid trade cannot contain all-zero fields because trade IDs,
 # order IDs, and quantity must be positive.
-
 POISON_PILL_RECORD = TRADE_STRUCT.pack(
-    0, 0, 0, 0.0, 0, 0)
+    0, 0, 0, 0.0, 0, 0
+)
 
 
 class MmapTradeRingBuffer:
@@ -46,13 +47,19 @@ class MmapTradeRingBuffer:
         self.capacity = capacity
         self.record_size = TRADE_STRUCT.size
         self.header_size = HEADER.size
+
         self.file_size = self.header_size + (
             self.capacity * self.record_size
         )
 
         self.lock_filename = filename + ".lock"
         self._closed = False
-        self._watermark_monitor = BufferWatermarkMonitor('trade')
+
+        # Protect the shared lock file and mmap operations between
+        # threads in this process.
+        self._thread_lock = threading.RLock()
+
+        self._watermark_monitor = BufferWatermarkMonitor("trade")
 
         if not os.path.exists(filename):
             with open(filename, "wb") as file:
@@ -68,6 +75,7 @@ class MmapTradeRingBuffer:
         self.lock_file = open(self.lock_filename, "a+b")
 
         self.lock_file.seek(0, os.SEEK_END)
+
         if self.lock_file.tell() == 0:
             self.lock_file.write(b"\0")
             self.lock_file.flush()
@@ -94,44 +102,53 @@ class MmapTradeRingBuffer:
 
     @contextmanager
     def _lock(self):
-        self.lock_file.seek(0)
+        """
+        Acquire an in-process thread lock and a cross-process file lock.
+        """
 
-        if os.name == "nt":
-            import msvcrt
+        with self._thread_lock:
+            self.lock_file.seek(0)
 
-            msvcrt.locking(
-                self.lock_file.fileno(),
-                msvcrt.LK_LOCK,
-                1
-            )
+            if os.name == "nt":
+                import msvcrt
 
-            try:
-                yield
-            finally:
-                self.lock_file.seek(0)
                 msvcrt.locking(
                     self.lock_file.fileno(),
-                    msvcrt.LK_UNLCK,
+                    msvcrt.LK_LOCK,
                     1
                 )
-        else:
-            import fcntl
 
-            fcntl.flock(
-                self.lock_file.fileno(),
-                fcntl.LOCK_EX
-            )
+                try:
+                    yield
+                finally:
+                    self.lock_file.seek(0)
 
-            try:
-                yield
-            finally:
+                    msvcrt.locking(
+                        self.lock_file.fileno(),
+                        msvcrt.LK_UNLCK,
+                        1
+                    )
+
+            else:
+                import fcntl
+
                 fcntl.flock(
                     self.lock_file.fileno(),
-                    fcntl.LOCK_UN
+                    fcntl.LOCK_EX
                 )
 
+                try:
+                    yield
+                finally:
+                    fcntl.flock(
+                        self.lock_file.fileno(),
+                        fcntl.LOCK_UN
+                    )
+
     def _read_header(self):
-        return HEADER.unpack(self.mm[:self.header_size])
+        return HEADER.unpack(
+            self.mm[:self.header_size]
+        )
 
     def _write_header(
         self,
@@ -157,8 +174,10 @@ class MmapTradeRingBuffer:
     def _contains_poison_locked(self):
         """
         Check whether the shutdown marker exists among unread records.
+
         Caller must hold the shared lock.
         """
+
         (
             write_index,
             item_count,
@@ -186,6 +205,7 @@ class MmapTradeRingBuffer:
     @property
     def is_shutdown(self):
         """Return True once a shutdown marker has been published."""
+
         with self._lock():
             return self._contains_poison_locked()
 
@@ -233,8 +253,15 @@ class MmapTradeRingBuffer:
                 offset:offset + self.record_size
             ] = record
 
-            write_index = (write_index + 1) % self.capacity
-            item_count = min(item_count + 1, self.capacity)
+            write_index = (
+                write_index + 1
+            ) % self.capacity
+
+            item_count = min(
+                item_count + 1,
+                self.capacity
+            )
+
             unread_count += 1
             sequence_number += 1
 
@@ -245,8 +272,10 @@ class MmapTradeRingBuffer:
                 unread_count,
                 sequence_number
             )
+
             self._watermark_monitor.update(
-                unread_count, self.capacity
+                unread_count,
+                self.capacity
             )
 
             return sequence_number
@@ -256,10 +285,12 @@ class MmapTradeRingBuffer:
         Publish a poison pill after all pending trades.
 
         If the buffer is full, wait for the consumer to free a slot.
+
         Return True if this call publishes the marker.
         Return False if shutdown was already published.
         Raise TimeoutError if no slot becomes available in time.
         """
+
         if timeout is not None and timeout < 0:
             raise ValueError("timeout cannot be negative")
 
@@ -267,7 +298,8 @@ class MmapTradeRingBuffer:
             raise ValueError("poll_interval must be positive")
 
         deadline = (
-            None if timeout is None
+            None
+            if timeout is None
             else time.monotonic() + timeout
         )
 
@@ -310,8 +342,10 @@ class MmapTradeRingBuffer:
                         unread_count,
                         sequence_number
                     )
+
                     self._watermark_monitor.update(
-                        unread_count, self.capacity
+                        unread_count,
+                        self.capacity
                     )
 
                     return True
@@ -325,7 +359,10 @@ class MmapTradeRingBuffer:
                         "to publish shutdown marker"
                     )
 
-                time.sleep(min(poll_interval, remaining))
+                time.sleep(
+                    min(poll_interval, remaining)
+                )
+
             else:
                 time.sleep(poll_interval)
 
@@ -340,6 +377,7 @@ class MmapTradeRingBuffer:
 
         Release a normal memoryview before calling consume().
         """
+
         with self._lock():
             (
                 write_index,
@@ -367,6 +405,7 @@ class MmapTradeRingBuffer:
 
     def consume(self):
         """Consume the next normal trade, never the shutdown marker."""
+
         with self._lock():
             (
                 write_index,
@@ -392,7 +431,10 @@ class MmapTradeRingBuffer:
                     "Cannot consume the shutdown marker"
                 )
 
-            read_index = (read_index + 1) % self.capacity
+            read_index = (
+                read_index + 1
+            ) % self.capacity
+
             unread_count -= 1
 
             self._write_header(
@@ -402,12 +444,15 @@ class MmapTradeRingBuffer:
                 unread_count,
                 sequence_number
             )
+
             self._watermark_monitor.update(
-                unread_count, self.capacity
+                unread_count,
+                self.capacity
             )
 
     def read_next(self):
         """Copy and return the next trade, then consume it."""
+
         view = self.read_next_view()
 
         if view is None:
@@ -437,7 +482,8 @@ class MmapTradeRingBuffer:
             ) = self._read_header()
 
             metrics = self._watermark_monitor.update(
-                unread_count, self.capacity
+                unread_count,
+                self.capacity
             )
 
             return {
@@ -455,10 +501,11 @@ class MmapTradeRingBuffer:
         if self._closed:
             return
 
-        self.mm.close()
-        self.lock_file.close()
-        self.file.close()
-        self._closed = True
+        with self._thread_lock:
+            self.mm.close()
+            self.lock_file.close()
+            self.file.close()
+            self._closed = True
 
     def __enter__(self):
         return self
