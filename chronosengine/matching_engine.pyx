@@ -1,4 +1,5 @@
 ﻿from libc.stdlib cimport malloc, free
+from libc.stddef cimport size_t
 from .matching_engine cimport Order, OrderNode
 from .latency_metrics import RollingLatencyPercentiles
 from math import isfinite
@@ -24,6 +25,9 @@ cdef class OrderNodePool:
 
         if capacity <= 0:
             raise ValueError("Pool capacity must be positive")
+
+        if <size_t>capacity > (<size_t>-1) // sizeof(OrderNode):
+            raise OverflowError("Order node pool capacity is too large")
 
         self._nodes = <OrderNode*>malloc(
             capacity * sizeof(OrderNode)
