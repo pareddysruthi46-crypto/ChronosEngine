@@ -222,3 +222,7 @@ __marimo__/
 # Generated Cython C++ files
 chronosengine/*.cpp
 chronosengine/*.pyd
+
+# Firehose test buffer files
+orders_buffer.dat
+test_orders.dat
