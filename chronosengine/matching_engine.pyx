@@ -699,6 +699,27 @@ cdef class MatchingEngine:
     def get_trades(self):
         return list(self._trades)
 
+    def get_trades_since(self, start_index):
+        """
+        Return only trades created since the supplied history index.
+
+        This avoids copying the complete trade history repeatedly
+        when the production pipeline extracts newly generated trades.
+
+        The existing get_trades() method remains available.
+        """
+
+        if isinstance(start_index, bool) or not isinstance(start_index, int):
+            raise TypeError("start_index must be an integer")
+
+        if start_index < 0 or start_index > len(self._trades):
+            raise ValueError(
+                "start_index must be between 0 and the current trade count"
+            )
+
+        return list(self._trades[start_index:])
+
+
     def get_sweep_events(self):
         return [
             {

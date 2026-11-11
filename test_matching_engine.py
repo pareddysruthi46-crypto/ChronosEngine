@@ -111,3 +111,68 @@ assert first_result[1]["buys"] == []
 print("PASS: Matching results are deterministic")
 
 print("All matching tests passed!")
+
+
+# Test 8: Incremental trade extraction must not duplicate or miss trades.
+engine = MatchingEngine()
+
+# Create two resting sell orders at different prices.
+engine.submit_order(501, "S", 100, 2, 1)
+engine.submit_order(502, "S", 101, 3, 2)
+
+# This buy order matches both resting sell orders, producing two trades.
+engine.submit_order(503, "B", 105, 3, 3)
+
+cursor = 0
+first_batch = engine.get_trades_since(cursor)
+
+assert len(first_batch) == 2
+assert first_batch[0]["sell_order_id"] == 501
+assert first_batch[0]["quantity"] == 2
+assert first_batch[1]["sell_order_id"] == 502
+assert first_batch[1]["quantity"] == 1
+
+cursor += len(first_batch)
+assert cursor == 2
+
+# Create another trade after advancing the cursor.
+engine.submit_order(504, "S", 102, 2, 4)
+engine.submit_order(505, "B", 105, 2, 5)
+
+second_batch = engine.get_trades_since(cursor)
+
+assert len(second_batch) == 1
+assert second_batch[0]["sell_order_id"] == 502
+assert second_batch[0]["quantity"] == 2
+
+cursor += len(second_batch)
+assert cursor == 3
+
+# Reading again at the current cursor must return no duplicate trades.
+third_batch = engine.get_trades_since(cursor)
+assert third_batch == []
+
+# All incremental batches must exactly match the full trade history.
+incremental_trades = first_batch + second_batch + third_batch
+assert incremental_trades == engine.get_trades()
+assert cursor == len(engine.get_trades())
+
+print("PASS: Incremental extraction, cursor advancement, and no duplicates")
+
+
+# Test 9: Invalid incremental extraction cursors must be rejected.
+for invalid_cursor, expected_exception in [
+    (-1, ValueError),
+    (len(engine.get_trades()) + 1, ValueError),
+    (True, TypeError),
+    (1.5, TypeError),
+]:
+    try:
+        engine.get_trades_since(invalid_cursor)
+        raise AssertionError(
+            f"Expected {expected_exception.__name__} for {invalid_cursor!r}"
+        )
+    except expected_exception:
+        pass
+
+print("PASS: Invalid incremental extraction cursors are rejected")
