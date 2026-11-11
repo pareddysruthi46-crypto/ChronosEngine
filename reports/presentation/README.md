@@ -66,3 +66,7 @@ The persistence worker batches writes and retries failed batch inserts. SQLite i
 ## Order book algorithm and compiled engine benchmark
 
 See [Order Book Algorithm and Compiled Engine Benchmark](order_book_cython_benchmark.md) for the matching algorithm, Cython implementation, accuracy validation, throughput measurements, and benchmark limitations.
+
+## Final sub-50 microsecond latency validation
+
+See [Final Sub-50 Microsecond Latency Validation](sub_50_microsecond_latency_validation.md) for aggregate and per-run latency tables, threshold results, methodology, and measurement limitations.
