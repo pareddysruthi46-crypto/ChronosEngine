@@ -233,10 +233,8 @@ class ProductionPipeline:
 
                 self._increment_counter("processed_orders")
 
-                trades = self.engine.get_trades()
-
-                new_trades = trades[last_trade_count:]
-                last_trade_count = len(trades)
+                new_trades = self.engine.get_trades_since(last_trade_count)
+                last_trade_count += len(new_trades)
 
                 for trade in new_trades:
                     while True:
