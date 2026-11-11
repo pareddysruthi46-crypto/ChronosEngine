@@ -62,3 +62,7 @@ The persistence worker batches writes and retries failed batch inserts. SQLite i
 - The ingestion comparison has one run per batch-size configuration.
 - Results are machine- and workload-dependent.
 - Repeat the ingestion matrix several times before making production tuning decisions.
+
+## Order book algorithm and compiled engine benchmark
+
+See [Order Book Algorithm and Compiled Engine Benchmark](order_book_cython_benchmark.md) for the matching algorithm, Cython implementation, accuracy validation, throughput measurements, and benchmark limitations.
